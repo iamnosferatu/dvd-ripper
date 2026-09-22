@@ -14,7 +14,8 @@
 #
 # Usage:
 #   ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
-#                 [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS] [-k]
+#                 [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS]
+#                 [-L eng,fre,...] [-k]
 #
 #   -d DEVICE     Optical drive device (default: /dev/sr0)
 #   -m MODE       auto (default) | movie | tv | music
@@ -24,6 +25,8 @@
 #                 (default: ~/Videos/Jellyfin for video, ~/Music/Jellyfin for audio)
 #   -q QUALITY    x265 CRF for video encodes (default: 20; lower = higher quality/bigger file)
 #   -l MINLENGTH  Minimum title length in seconds for MakeMKV to keep (default: 120)
+#   -L LANGS      Comma-separated subtitle language codes to include, if present on the
+#                 disc (default: eng). Soft subtitles only — never burned in.
 #   -k            Keep temporary raw-rip files instead of deleting them after encode
 #
 set -euo pipefail
@@ -40,6 +43,7 @@ MUSIC_OUTPUT_ROOT="${HOME}/Music/Jellyfin"
 OUTPUT_ROOT_OVERRIDE=""
 QUALITY=20
 MINLENGTH=120
+SUBTITLE_LANGS="eng"
 KEEP_TEMP=0
 WORKDIR="$(mktemp -d /tmp/discrip.XXXXXX)"
 
@@ -75,7 +79,7 @@ sanitize() {
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-while getopts "d:m:n:s:o:q:l:kh" opt; do
+while getopts "d:m:n:s:o:q:l:L:kh" opt; do
     case "$opt" in
         d) DEVICE="$OPTARG" ;;
         m) MODE="$OPTARG" ;;
@@ -84,6 +88,7 @@ while getopts "d:m:n:s:o:q:l:kh" opt; do
         o) OUTPUT_ROOT_OVERRIDE="$OPTARG" ;;
         q) QUALITY="$OPTARG" ;;
         l) MINLENGTH="$OPTARG" ;;
+        L) SUBTITLE_LANGS="$OPTARG" ;;
         k) KEEP_TEMP=1 ;;
         h) usage ;;
         *) usage ;;
@@ -263,6 +268,7 @@ encode_one() {
         --aencoder copy:ac3,copy:dts,av_aac \
         --audio-fallback av_aac \
         --all-subtitles \
+        --subtitle-lang-list "$SUBTITLE_LANGS" \
         --subtitle-burned=none \
         --markers \
         --optimize \

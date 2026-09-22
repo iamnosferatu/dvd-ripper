@@ -37,7 +37,8 @@ command -v makemkvcon HandBrakeCLI abcde cdparanoia flac blkid udisksctl
 
 ```bash
 ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
-              [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS] [-k]
+              [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS]
+              [-L eng,fre,...] [-k]
 ```
 
 | Flag | Meaning | Default |
@@ -49,6 +50,7 @@ command -v makemkvcon HandBrakeCLI abcde cdparanoia flac blkid udisksctl
 | `-o` | Library root; `Movies/`, `TV Shows/`, `Music/` subfolders are created under it | `~/Videos/Jellyfin` (video) / `~/Music/Jellyfin` (audio) |
 | `-q` | x265 CRF for video encodes — lower = higher quality/bigger file | `20` |
 | `-l` | Minimum title length in seconds for MakeMKV to keep (movie mode) | `120` |
+| `-L` | Comma-separated subtitle language codes to include, if present (soft subs only, never burned in) | `eng` |
 | `-k` | Keep temporary raw MakeMKV rip files instead of deleting them | off |
 
 ### Examples
@@ -115,7 +117,10 @@ what this script produces by default.
 ## Notes
 
 - Video encodes keep all audio tracks (AC3/DTS passthrough where possible,
-  AAC fallback) and all subtitle tracks, plus chapter markers.
+  AAC fallback), plus chapter markers. Subtitles are included as soft
+  (selectable) tracks — never burned in — filtered to the languages set by
+  `-L` (default English only); if the disc has no matching subtitle track,
+  none are added and encoding proceeds normally.
 - Two-pass x265 encoding is used for consistent quality; expect a rip to
   take significantly longer than the runtime of the disc.
 - Data discs (non-VIDEO_TS, non-audio-CD) are not supported and the script
