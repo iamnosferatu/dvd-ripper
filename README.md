@@ -1,6 +1,6 @@
 # rip-disc.sh
 
-Rip a DVD (movie or TV) or audio CD on Fedora into a Jellyfin-ready media
+Rip a DVD (movie or TV) or audio CD on Ubuntu into a Jellyfin-ready media
 library. Auto-detects what's in the drive and routes to the right pipeline:
 
 | Disc type   | Pipeline                                                        | Output layout |
@@ -13,16 +13,45 @@ Auto-detection can reliably tell an audio CD from a DVD-Video disc, but it
 can't tell a movie disc from a TV disc (both are just DVD-Video) — pass
 `-m tv` explicitly for TV discs.
 
-## Install (Fedora 44)
+## Install (Ubuntu)
+
+Run the setup script — it installs every dependency, offers to add the
+community MakeMKV PPA, adds you to the `cdrom` group, and creates the
+default library directories:
 
 ```bash
-sudo dnf install -y HandBrake-cli abcde cdparanoia flac cd-discid genisoimage
+./setup.sh
 ```
 
-MakeMKV isn't in Fedora's default repos or RPM Fusion as a prebuilt package
-in all cases — grab the current build from [makemkv.com](https://www.makemkv.com/download/)
-(free during its beta license period) and follow its install instructions,
-or build from the RPM Fusion `makemkv` package if available on your release.
+Pass `-y` to accept all prompts non-interactively (still asks for your
+`sudo` password for package installs):
+
+```bash
+./setup.sh -y
+```
+
+If you added yourself to the `cdrom` group for the first time, log out and
+back in (or reboot) before ripping — group membership doesn't apply to
+already-running sessions.
+
+### Manual install
+
+If you'd rather not run `setup.sh`:
+
+```bash
+sudo apt-get install -y handbrake-cli abcde cdparanoia flac cd-discid genisoimage udisks2
+```
+
+MakeMKV isn't in Ubuntu's official repos. Either add the community PPA:
+
+```bash
+sudo add-apt-repository ppa:heyarje/makemkv-beta
+sudo apt-get update
+sudo apt-get install -y makemkv-bin makemkv-oss
+```
+
+or download the current build directly from [makemkv.com](https://www.makemkv.com/download/)
+(free during its beta license period) and follow its install instructions.
 
 Verify everything is on your `PATH`:
 
@@ -30,7 +59,7 @@ Verify everything is on your `PATH`:
 command -v makemkvcon HandBrakeCLI abcde cdparanoia flac blkid udisksctl
 ```
 
-`blkid` and `udisksctl` ship with Fedora by default (`util-linux` and
+`blkid` and `udisksctl` ship with Ubuntu by default (`util-linux` and
 `udisks2`), so you shouldn't need to install those separately.
 
 ## Usage

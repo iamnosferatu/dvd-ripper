@@ -8,9 +8,12 @@
 #   DVD, TV     -> MakeMKV title scan -> interactive confirmation of which
 #                  titles map to which episodes -> HandBrakeCLI, named S01E01...
 #
-# Requirements (Fedora 44):
-#   sudo dnf install -y HandBrake-cli abcde cdparanoia flac cd-discid genisoimage
-#   MakeMKV: install from makemkv.com or RPM Fusion (not in default Fedora repos)
+# Requirements (Ubuntu):
+#   Run ./setup.sh to install everything automatically, or manually:
+#     sudo apt-get install -y handbrake-cli abcde cdparanoia flac cd-discid genisoimage udisks2
+#   MakeMKV: not in Ubuntu's official repos. setup.sh offers to add the
+#   community ppa:heyarje/makemkv-beta PPA, or install manually from
+#   https://www.makemkv.com/download/
 #
 # Usage:
 #   ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
