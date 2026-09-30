@@ -1,5 +1,7 @@
 # rip-disc.sh
 
+![Last commit](https://img.shields.io/github/last-commit/iamnosferatu/dvd-ripper)
+
 Rip a DVD (movie or TV) or audio CD on Ubuntu into a Jellyfin-ready media
 library. Auto-detects what's in the drive and routes to the right pipeline:
 
