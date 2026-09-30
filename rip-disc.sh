@@ -36,13 +36,14 @@
 #   the README for an 8-drive style batch ripping setup.
 #
 #   MakeMKV's raw rip is disc I/O, not CPU, so every drive can do that step
-#   at once with no contention. HandBrake's x265 encode is CPU-heavy, so -j
-#   caps how many encodes run at once *across all drives* — instances beyond
-#   that just wait their turn (their raw rip is already done and sitting in
-#   a temp dir, so the drive itself is free again once -k isn't set... but
-#   note the disc itself isn't ejected until its own encode finishes; see -E).
-#   The limit is enforced with flock on shared lock files in /tmp, so it
-#   applies across every concurrently running rip-disc.sh process.
+#   at once with no contention. The disc is ejected (see -E) as soon as its
+#   raw rip finishes — not after encoding — since the drive is never touched
+#   again once the rip is on local disk. HandBrake's x265 encode is
+#   CPU-heavy, so -j caps how many encodes run at once *across all drives*;
+#   a drive whose own rip is already done just sits queued (raw file on
+#   local disk, drive already free for the next disc) until an encode slot
+#   opens up. The limit is enforced with flock on shared lock files in /tmp,
+#   so it applies across every concurrently running rip-disc.sh process.
 #
 # Usage:
 #   ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
@@ -387,10 +388,28 @@ confirm_episode_selection() {
     [[ "$confirm" =~ ^[Yy]$ ]] || die "Aborted by user — rerun and adjust the title selection."
 }
 
+DISC_EJECTED=0
+
+# Ejects as soon as MakeMKV's raw rip is done, not after encoding — once the
+# rip is on local disk, HandBrake never touches the drive again, so there's
+# no concurrency issue freeing the drive early. This is what lets a drive's
+# turnaround be just its (fast, I/O-bound) rip time instead of rip+encode,
+# even while its encode is still queued behind -j on other drives.
 eject_disc() {
     [[ "$AUTO_EJECT" -eq 1 ]] || return 0
-    log "Ejecting $DEVICE..."
-    eject "$DEVICE" 2>/dev/null || warn "Failed to eject $DEVICE — you may need to remove the disc manually."
+    [[ "$DISC_EJECTED" -eq 1 ]] && return 0
+
+    if [[ "$MOUNTED_BY_US" -eq 1 ]]; then
+        udisksctl unmount -b "$DEVICE" >/dev/null 2>&1 || true
+        MOUNTED_BY_US=0
+    fi
+
+    log "Rip complete — ejecting $DEVICE (encoding continues from the local copy)..."
+    if eject "$DEVICE" 2>/dev/null; then
+        DISC_EJECTED=1
+    else
+        warn "Failed to eject $DEVICE — you may need to remove the disc manually."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -511,6 +530,8 @@ rip_movie() {
     shopt -u nullglob
     [[ ${#raw_files[@]} -gt 0 ]] || die "MakeMKV produced no output files. Check the disc and drive."
 
+    eject_disc
+
     local index=0
     for raw in "${raw_files[@]}"; do
         index=$((index + 1))
@@ -524,7 +545,6 @@ rip_movie() {
     done
 
     log "All done. Point Jellyfin's Movies library at: $output_root"
-    eject_disc
 }
 
 # ---------------------------------------------------------------------------
@@ -575,32 +595,47 @@ rip_tv() {
     scan_titles
     confirm_episode_selection
 
+    # Phase 1: rip every selected episode from the disc first (each title
+    # into its own subdirectory so they don't overwrite each other), then
+    # eject — the disc isn't needed again once these files are on local
+    # disk. Phase 2 (below) encodes from those local files only.
     local src="dev:${DEVICE}"
     local ep=0 id
+    local raw_paths=() final_paths=()
     for id in "${SELECTED_TITLES[@]}"; do
         ep=$((ep + 1))
         local ep_padded
         ep_padded="$(printf '%02d' "$ep")"
         local final_path="${season_dir}/${safe_show} - S${season_padded}E${ep_padded}.mkv"
+        local rip_dir="${WORKDIR}/rip-${id}"
+        mkdir -p "$rip_dir"
 
         log "Ripping title $id (-> S${season_padded}E${ep_padded}) with MakeMKV..."
-        rm -f "$WORKDIR"/*.mkv 2>/dev/null || true
-        makemkvcon mkv "$src" "$id" "$WORKDIR" --minlength=0 --noscan
+        makemkvcon mkv "$src" "$id" "$rip_dir" --minlength=0 --noscan
 
         shopt -s nullglob
-        local raw_files=("$WORKDIR"/*.mkv)
+        local title_files=("$rip_dir"/*.mkv)
         shopt -u nullglob
-        [[ ${#raw_files[@]} -eq 1 ]] || die "Expected exactly one output file ripping title $id, found ${#raw_files[@]}."
+        [[ ${#title_files[@]} -eq 1 ]] || die "Expected exactly one output file ripping title $id, found ${#title_files[@]}."
 
-        log "Encoding: $(basename "${raw_files[0]}") -> $(basename "$final_path")"
-        encode_one "${raw_files[0]}" "$final_path"
-        log "Finished: $final_path"
+        raw_paths+=("${title_files[0]}")
+        final_paths+=("$final_path")
+    done
 
-        [[ "$KEEP_TEMP" -eq 1 ]] || rm -f "${raw_files[0]}"
+    log "All ${#raw_paths[@]} episode(s) ripped from disc."
+    eject_disc
+
+    # Phase 2: encode each local raw file.
+    local i
+    for (( i=0; i<${#raw_paths[@]}; i++ )); do
+        log "Encoding: $(basename "${raw_paths[$i]}") -> $(basename "${final_paths[$i]}")"
+        encode_one "${raw_paths[$i]}" "${final_paths[$i]}"
+        log "Finished: ${final_paths[$i]}"
+
+        [[ "$KEEP_TEMP" -eq 1 ]] || rm -f "${raw_paths[$i]}"
     done
 
     log "All done. Point Jellyfin's TV Shows library at: $output_root"
-    eject_disc
 }
 
 # ---------------------------------------------------------------------------

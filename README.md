@@ -220,10 +220,14 @@ still picks movie vs. music; TV discs ripped through automation are treated
 as movies unless you edit the systemd unit to add `-m tv -n "Show" -s N` for
 a given drive/disc run.
 
-When ripping finishes, the script **ejects the disc and opens the tray**
-(this is now the default for every run, not just automated ones — pass `-E`
-to keep the default off) so you can tell at a glance which drives are free
-to load the next disc.
+The disc is ejected **as soon as its raw MakeMKV rip is done — not after
+encoding** (this is the default for every run, not just automated ones;
+pass `-E` to disable it). Once the rip is sitting in a local temp file, the
+encode step never touches the drive again, so there's no reason to keep the
+disc in longer than that: a drive's turnaround is its rip time, not
+rip+encode time, even while its encode is still queued behind `-j` on other
+drives. This is what actually lets an 8-drive setup keep moving — drives
+free up fast, while a handful of encodes churn through the backlog.
 
 Useful commands once it's installed:
 
