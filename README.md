@@ -94,7 +94,7 @@ MusicBrainz for artist/album/track metadata on every audio CD rip.
 ```bash
 ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
               [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS]
-              [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-y] [-E] [-k]
+              [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-y] [-E] [-j N] [-k]
 ```
 
 | Flag | Meaning | Default |
@@ -111,6 +111,7 @@ MusicBrainz for artist/album/track metadata on every audio CD rip.
 | `-M` | Disable TMDb metadata lookup even if a key is available | off |
 | `-y` | Non-interactive: auto-pick TMDb's top match and all titles in disc order instead of prompting | off |
 | `-E` | Disable auto-eject on completion | off (auto-eject is **on** by default) |
+| `-j` | Max simultaneous HandBrake encodes, system-wide across all drives (`0` = unlimited) | `2` |
 | `-k` | Keep temporary raw MakeMKV rip files instead of deleting them | off |
 
 ### Examples
@@ -150,6 +151,13 @@ Rip unattended (no prompts) and leave the disc in the drive afterward:
 
 ```bash
 ./rip-disc.sh -y -E
+```
+
+Allow up to 4 simultaneous encodes instead of the default 2 (e.g. on a
+high-core-count machine):
+
+```bash
+./rip-disc.sh -j 4
 ```
 
 ### TMDb title confirmation (movie/TV mode)
@@ -237,13 +245,21 @@ sudo systemctl daemon-reload
 
 A few things worth knowing for an 8-drive-style setup:
 
-- Each drive's rip is fully independent — loading discs into multiple
-  drives at once starts multiple concurrent rips.
-- HandBrake's x265 encode is CPU-heavy; running many drives' encodes at
-  once on one machine will contend for CPU and slow every rip down
-  proportionally. There's no built-in concurrency limiter — if that
-  matters for your hardware, consider a systemd `CPUQuota=` / slice on
-  `rip-disc@.service`, or staggering how many drives you load at once.
+- Each drive's MakeMKV rip is fully independent and uncapped — it's disc
+  I/O, not CPU, so all 8 drives can be reading discs at once with no
+  contention.
+- HandBrake's x265 encode is the CPU-heavy step, so it's gated by `-j`
+  (default **2** simultaneous encodes, system-wide, regardless of how many
+  drives are active). A drive that finishes ripping while the encode
+  slots are full just waits its turn — its raw rip sits in a temp
+  directory until a slot frees up, then it encodes and ejects. `setup.sh`
+  asks for this limit when installing the automation (baked into each
+  drive's systemd unit as `-j N`); change it later by editing the `-j`
+  value in `/etc/systemd/system/rip-disc@.service` and running
+  `sudo systemctl daemon-reload`. Pick a value based on your CPU — each
+  x265 encode is itself multi-threaded, so "2" already uses a lot of
+  cores; raise it only if you have cores to spare, or set `-j 0` to
+  disable the limiter entirely.
 - If a rip fails partway, the disc is **not** ejected, so a stalled drive
   is visibly still occupied — check `journalctl -u rip-disc@sr0` to see why.
 

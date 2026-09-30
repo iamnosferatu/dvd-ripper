@@ -35,10 +35,19 @@
 #   per drive, whenever a disc is inserted — see the "automatic" section of
 #   the README for an 8-drive style batch ripping setup.
 #
+#   MakeMKV's raw rip is disc I/O, not CPU, so every drive can do that step
+#   at once with no contention. HandBrake's x265 encode is CPU-heavy, so -j
+#   caps how many encodes run at once *across all drives* — instances beyond
+#   that just wait their turn (their raw rip is already done and sitting in
+#   a temp dir, so the drive itself is free again once -k isn't set... but
+#   note the disc itself isn't ejected until its own encode finishes; see -E).
+#   The limit is enforced with flock on shared lock files in /tmp, so it
+#   applies across every concurrently running rip-disc.sh process.
+#
 # Usage:
 #   ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
 #                 [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS]
-#                 [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-y] [-E] [-k]
+#                 [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-y] [-E] [-j N] [-k]
 #
 #   -d DEVICE     Optical drive device (default: /dev/sr0)
 #   -m MODE       auto (default) | movie | tv | music
@@ -57,6 +66,7 @@
 #                 order instead of prompting (required for udev/systemd triggering)
 #   -E            Disable auto-eject on completion (by default the tray opens
 #                 when the rip finishes, so you know the drive is free again)
+#   -j N          Max concurrent HandBrake encodes system-wide (default: 2; 0 = unlimited)
 #   -k            Keep temporary raw-rip files instead of deleting them after encode
 #
 set -euo pipefail
@@ -78,6 +88,7 @@ TMDB_API_KEY="${TMDB_API_KEY:-}"
 LOOKUP_DISABLED=0
 NONINTERACTIVE=0
 AUTO_EJECT=1
+MAX_ENCODES=2
 KEEP_TEMP=0
 WORKDIR="$(mktemp -d /tmp/discrip.XXXXXX)"
 
@@ -113,7 +124,7 @@ sanitize() {
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-while getopts "d:m:n:s:o:q:l:L:K:MyEkh" opt; do
+while getopts "d:m:n:s:o:q:l:L:K:MyEj:kh" opt; do
     case "$opt" in
         d) DEVICE="$OPTARG" ;;
         m) MODE="$OPTARG" ;;
@@ -127,11 +138,14 @@ while getopts "d:m:n:s:o:q:l:L:K:MyEkh" opt; do
         M) LOOKUP_DISABLED=1 ;;
         y) NONINTERACTIVE=1 ;;
         E) AUTO_EJECT=0 ;;
+        j) MAX_ENCODES="$OPTARG" ;;
         k) KEEP_TEMP=1 ;;
         h) usage ;;
         *) usage ;;
     esac
 done
+
+[[ "$MAX_ENCODES" =~ ^[0-9]+$ ]] || die "Invalid -j value '$MAX_ENCODES': must be a non-negative integer (0 = unlimited)."
 
 [[ -b "$DEVICE" ]] || die "Device '$DEVICE' does not look like a block device. Pass the correct drive with -d."
 
@@ -379,8 +393,51 @@ eject_disc() {
     eject "$DEVICE" 2>/dev/null || warn "Failed to eject $DEVICE — you may need to remove the disc manually."
 }
 
+# ---------------------------------------------------------------------------
+# Encode concurrency limiter — a flock-based counting semaphore shared across
+# every rip-disc.sh process on the machine (one lock file per slot in a
+# shared /tmp directory), so it caps concurrent HandBrake encodes system-wide
+# regardless of how many drives are ripping at once. MakeMKV's raw rip isn't
+# gated by this — only the encode_one() call is.
+# ---------------------------------------------------------------------------
+ENCODE_SLOT_DIR="/tmp/.rip-disc-encode-slots"
+ENCODE_SLOT_FD=""
+
+acquire_encode_slot() {
+    [[ "$MAX_ENCODES" -gt 0 ]] || return 0
+
+    mkdir -p "$ENCODE_SLOT_DIR"
+    chmod 1777 "$ENCODE_SLOT_DIR" 2>/dev/null || true
+
+    local announced=0 i
+    while true; do
+        for (( i=0; i<MAX_ENCODES; i++ )); do
+            exec {ENCODE_SLOT_FD}>"${ENCODE_SLOT_DIR}/slot-${i}.lock"
+            if flock -n "$ENCODE_SLOT_FD"; then
+                return 0
+            fi
+            exec {ENCODE_SLOT_FD}>&-
+            ENCODE_SLOT_FD=""
+        done
+        if [[ "$announced" -eq 0 ]]; then
+            log "All $MAX_ENCODES encode slot(s) busy with other drives — waiting for one to free up..."
+            announced=1
+        fi
+        sleep 10
+    done
+}
+
+release_encode_slot() {
+    [[ -n "$ENCODE_SLOT_FD" ]] || return 0
+    flock -u "$ENCODE_SLOT_FD" 2>/dev/null || true
+    exec {ENCODE_SLOT_FD}>&- 2>/dev/null || true
+    ENCODE_SLOT_FD=""
+}
+
 encode_one() {
     local raw="$1" final_path="$2"
+
+    acquire_encode_slot
     HandBrakeCLI \
         --input "$raw" \
         --output "$final_path" \
@@ -398,6 +455,7 @@ encode_one() {
         --format av_mkv \
         --two-pass \
         --turbo
+    release_encode_slot
 }
 
 # ---------------------------------------------------------------------------

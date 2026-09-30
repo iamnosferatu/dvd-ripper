@@ -124,6 +124,13 @@ if [[ ! -f "${SCRIPT_DIR}/rip-disc.sh" ]]; then
 elif confirm "Set up fully automatic ripping (auto-start on disc insert, auto-eject on completion)?"; then
     log "Installing udev rule and systemd service..."
 
+    MAX_ENCODES=2
+    if ! [[ "$ASSUME_YES" -eq 1 ]]; then
+        read -r -p "Max simultaneous HandBrake encodes across all drives [2]: " reply
+        [[ -n "$reply" ]] && MAX_ENCODES="$reply"
+    fi
+    [[ "$MAX_ENCODES" =~ ^[0-9]+$ ]] || { warn "Not a number, defaulting to 2."; MAX_ENCODES=2; }
+
     sudo tee /etc/rip-disc.env >/dev/null <<EOF
 # Environment for rip-disc@*.service (systemd EnvironmentFile format: KEY=VALUE, no 'export').
 TMDB_API_KEY=${SETUP_TMDB_API_KEY:-}
@@ -140,7 +147,7 @@ Wants=udisks2.service
 Type=oneshot
 User=${USER}
 EnvironmentFile=-/etc/rip-disc.env
-ExecStart=${SCRIPT_DIR}/rip-disc.sh -d /dev/%i -y
+ExecStart=${SCRIPT_DIR}/rip-disc.sh -d /dev/%i -y -j ${MAX_ENCODES}
 StandardOutput=journal
 StandardError=journal
 TimeoutStartSec=0
@@ -157,9 +164,10 @@ EOF
     sudo systemctl daemon-reload
 
     log "Automation installed."
-    AUTOMATION_NOTE="Automatic ripping is ON: insert a disc in any drive and it'll start ripping on its own."
+    AUTOMATION_NOTE="Automatic ripping is ON (max ${MAX_ENCODES} simultaneous encode(s)): insert a disc in any drive and it'll start ripping on its own."
     echo "  - Check progress: journalctl -u rip-disc@sr0 -f   (replace sr0 with the drive)"
     echo "  - Change TMDb key later: sudo nano /etc/rip-disc.env"
+    echo "  - Change the encode concurrency limit: edit the -j value in /etc/systemd/system/rip-disc@.service, then run 'sudo systemctl daemon-reload'"
     echo "  - Uninstall: sudo rm /etc/udev/rules.d/99-rip-disc.rules /etc/systemd/system/rip-disc@.service /etc/rip-disc.env && sudo udevadm control --reload-rules && sudo systemctl daemon-reload"
 else
     AUTOMATION_NOTE="Automatic ripping is OFF: run './rip-disc.sh' manually per disc (rerun setup.sh to enable it later)."
