@@ -62,24 +62,53 @@ command -v makemkvcon HandBrakeCLI abcde cdparanoia flac blkid udisksctl
 `blkid` and `udisksctl` ship with Ubuntu by default (`util-linux` and
 `udisks2`), so you shouldn't need to install those separately.
 
+### Metadata lookup (optional but recommended)
+
+By default, if you don't pass `-n`, movie and TV modes use the disc's raw
+volume label as the name — which is often garbled (`BLADE_RUNNER_1982_WS`).
+To get clean, accurate names instead, rip-disc.sh can search
+[TMDb](https://www.themoviedb.org) (The Movie Database) using the disc label
+as a query, show you the matching results, and let you confirm which one is
+correct before anything is ripped.
+
+This needs a free TMDb API key:
+
+1. Create an account at [themoviedb.org](https://www.themoviedb.org/signup)
+2. Generate a key at [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)
+3. Either export it so `rip-disc.sh` picks it up automatically:
+   ```bash
+   echo 'export TMDB_API_KEY=your_key_here' >> ~/.bashrc
+   source ~/.bashrc
+   ```
+   or pass it per run with `-K your_key_here`
+
+`setup.sh` offers to save this for you interactively. Without a key (or with
+`-M`), rip-disc.sh just falls back to prompting you for a name manually —
+nothing breaks.
+
+Music mode already gets database-driven naming for free: `abcde` queries
+MusicBrainz for artist/album/track metadata on every audio CD rip.
+
 ## Usage
 
 ```bash
 ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
               [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS]
-              [-L eng,fre,...] [-k]
+              [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-k]
 ```
 
 | Flag | Meaning | Default |
 |------|---------|---------|
 | `-d` | Optical drive device | `/dev/sr0` |
 | `-m` | Mode: `auto`, `movie`, `tv`, `music` | `auto` |
-| `-n` | Movie title (`"Name (Year)"`) or TV show name | disc label |
+| `-n` | Movie title (`"Name (Year)"`) or TV show name — skips TMDb lookup entirely | disc label / TMDb match |
 | `-s` | Season number (TV mode only) | `1` |
 | `-o` | Library root; `Movies/`, `TV Shows/`, `Music/` subfolders are created under it | `~/Videos/Jellyfin` (video) / `~/Music/Jellyfin` (audio) |
 | `-q` | x265 CRF for video encodes — lower = higher quality/bigger file | `20` |
 | `-l` | Minimum title length in seconds for MakeMKV to keep (movie mode) | `120` |
 | `-L` | Comma-separated subtitle language codes to include, if present (soft subs only, never burned in) | `eng` |
+| `-K` | TMDb API key (overrides the `TMDB_API_KEY` environment variable) | — |
+| `-M` | Disable TMDb metadata lookup even if a key is available | off |
 | `-k` | Keep temporary raw MakeMKV rip files instead of deleting them | off |
 
 ### Examples
@@ -108,6 +137,28 @@ Rip an audio CD to a custom music library location:
 ```bash
 ./rip-disc.sh -m music -o /mnt/media/Music
 ```
+
+Skip TMDb lookup for this run and just prompt for a name manually:
+
+```bash
+./rip-disc.sh -M
+```
+
+### TMDb title confirmation (movie/TV mode)
+
+When `-n` isn't given and a TMDb API key is available, you'll see something
+like this before ripping starts:
+
+```
+TMDb matches for 'BLADE_RUNNER_1982_WS':
+  1) Blade Runner (1982)
+  2) Blade Runner: The Final Cut (1982)
+  0) None of these — enter the name manually
+Pick a match [0-2]:
+```
+
+Choosing `0`, declining, or hitting a network error all fall back to a plain
+manual-entry prompt — nothing fails hard.
 
 ### TV mode's interactive confirmation
 
@@ -154,3 +205,5 @@ what this script produces by default.
   take significantly longer than the runtime of the disc.
 - Data discs (non-VIDEO_TS, non-audio-CD) are not supported and the script
   will exit with an error.
+- TMDb/MusicBrainz lookups need internet access. If you're ripping offline,
+  pass `-M` (or just decline the prompts) to name things manually.

@@ -10,19 +10,30 @@
 #
 # Requirements (Ubuntu):
 #   Run ./setup.sh to install everything automatically, or manually:
-#     sudo apt-get install -y handbrake-cli abcde cdparanoia flac cd-discid genisoimage udisks2
+#     sudo apt-get install -y handbrake-cli abcde cdparanoia flac cd-discid genisoimage udisks2 jq
 #   MakeMKV: not in Ubuntu's official repos. setup.sh offers to add the
 #   community ppa:heyarje/makemkv-beta PPA, or install manually from
 #   https://www.makemkv.com/download/
 #
+# Metadata lookup (movie/TV naming):
+#   When -n isn't given, movie and TV modes search themoviedb.org (TMDb) using
+#   the disc label as the query and let you confirm the match interactively,
+#   so folders/files are named from real metadata (correct title + year)
+#   instead of a raw disc label. Requires a free TMDb API key (from
+#   https://www.themoviedb.org/settings/api) exported as TMDB_API_KEY, or
+#   passed with -K. Without a key, or with -M, lookup is skipped and it falls
+#   back to prompting for a manual name (same as before). Music mode already
+#   gets database-driven naming for free via MusicBrainz (through abcde).
+#
 # Usage:
 #   ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
 #                 [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS]
-#                 [-L eng,fre,...] [-k]
+#                 [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-k]
 #
 #   -d DEVICE     Optical drive device (default: /dev/sr0)
 #   -m MODE       auto (default) | movie | tv | music
-#   -n NAME       Movie title "Name (Year)", or TV show name. Falls back to disc label.
+#   -n NAME       Movie title "Name (Year)", or TV show name. Skips TMDb lookup
+#                 entirely and uses this name as given.
 #   -s SEASON     Season number for TV mode (default: 1)
 #   -o ROOT       Library root. Subfolders Movies/, TV Shows/, Music/ are created under it.
 #                 (default: ~/Videos/Jellyfin for video, ~/Music/Jellyfin for audio)
@@ -30,6 +41,8 @@
 #   -l MINLENGTH  Minimum title length in seconds for MakeMKV to keep (default: 120)
 #   -L LANGS      Comma-separated subtitle language codes to include, if present on the
 #                 disc (default: eng). Soft subtitles only — never burned in.
+#   -K API_KEY    TMDb API key (overrides the TMDB_API_KEY environment variable)
+#   -M            Disable TMDb metadata lookup even if an API key is available
 #   -k            Keep temporary raw-rip files instead of deleting them after encode
 #
 set -euo pipefail
@@ -47,6 +60,8 @@ OUTPUT_ROOT_OVERRIDE=""
 QUALITY=20
 MINLENGTH=120
 SUBTITLE_LANGS="eng"
+TMDB_API_KEY="${TMDB_API_KEY:-}"
+LOOKUP_DISABLED=0
 KEEP_TEMP=0
 WORKDIR="$(mktemp -d /tmp/discrip.XXXXXX)"
 
@@ -82,7 +97,7 @@ sanitize() {
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-while getopts "d:m:n:s:o:q:l:L:kh" opt; do
+while getopts "d:m:n:s:o:q:l:L:K:Mkh" opt; do
     case "$opt" in
         d) DEVICE="$OPTARG" ;;
         m) MODE="$OPTARG" ;;
@@ -92,6 +107,8 @@ while getopts "d:m:n:s:o:q:l:L:kh" opt; do
         q) QUALITY="$OPTARG" ;;
         l) MINLENGTH="$OPTARG" ;;
         L) SUBTITLE_LANGS="$OPTARG" ;;
+        K) TMDB_API_KEY="$OPTARG" ;;
+        M) LOOKUP_DISABLED=1 ;;
         k) KEEP_TEMP=1 ;;
         h) usage ;;
         *) usage ;;
@@ -136,6 +153,67 @@ detect_disc_type() {
 
 resolve_disc_label() {
     lsblk -no LABEL "$DEVICE" 2>/dev/null | head -n1 | tr -s ' _' '  ' | sed -e 's/^ *//' -e 's/ *$//'
+}
+
+# ---------------------------------------------------------------------------
+# TMDb metadata lookup (movie/TV naming from a real database instead of the
+# disc's often-garbled volume label)
+# ---------------------------------------------------------------------------
+LOOKUP_TITLE=""
+LOOKUP_YEAR=""
+
+lookup_available() {
+    [[ "$LOOKUP_DISABLED" -eq 0 && -n "$TMDB_API_KEY" ]] || return 1
+    command -v curl >/dev/null 2>&1 || { warn "'curl' not found; skipping TMDb lookup."; return 1; }
+    command -v jq >/dev/null 2>&1 || { warn "'jq' not found; skipping TMDb lookup. Install with: sudo apt-get install -y jq"; return 1; }
+    return 0
+}
+
+# Search TMDb for $2 (kind = movie|tv) matching $1 (query text), and let the
+# user interactively confirm a result. On success, sets LOOKUP_TITLE (and
+# LOOKUP_YEAR, if known) and returns 0. Returns 1 if the user declines, there
+# are no matches, or the request fails — callers should fall back gracefully.
+lookup_metadata() {
+    local kind="$1" query="$2"
+    local title_field year_field
+    if [[ "$kind" == "movie" ]]; then title_field="title"; year_field="release_date"
+    else title_field="name"; year_field="first_air_date"; fi
+
+    local resp
+    resp="$(curl -sS --fail --get "https://api.themoviedb.org/3/search/${kind}" \
+        --data-urlencode "api_key=${TMDB_API_KEY}" \
+        --data-urlencode "query=${query}" \
+        --data-urlencode "include_adult=false" 2>/dev/null)" || {
+        warn "TMDb lookup failed (network error or invalid API key)."
+        return 1
+    }
+
+    local count
+    count="$(echo "$resp" | jq -r '.results | length' 2>/dev/null || echo 0)"
+    if [[ -z "$count" || "$count" -eq 0 ]]; then
+        warn "No TMDb matches for '$query'."
+        return 1
+    fi
+    [[ "$count" -gt 8 ]] && count=8
+
+    echo
+    echo "TMDb matches for '$query':"
+    local i t y
+    for (( i=0; i<count; i++ )); do
+        t="$(echo "$resp" | jq -r ".results[$i].${title_field}")"
+        y="$(echo "$resp" | jq -r ".results[$i].${year_field} // \"\"" | cut -c1-4)"
+        printf '  %d) %s (%s)\n' "$((i + 1))" "$t" "${y:-unknown year}"
+    done
+    echo "  0) None of these — enter the name manually"
+
+    local choice
+    read -r -p "Pick a match [0-${count}]: " choice
+    [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "$count" ]] || return 1
+
+    local idx=$((choice - 1))
+    LOOKUP_TITLE="$(echo "$resp" | jq -r ".results[$idx].${title_field}")"
+    LOOKUP_YEAR="$(echo "$resp" | jq -r ".results[$idx].${year_field} // \"\"" | cut -c1-4)"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -288,8 +366,22 @@ rip_movie() {
 
     local movie_name="$NAME"
     if [[ -z "$movie_name" ]]; then
-        movie_name="$(resolve_disc_label)"
-        [[ -n "$movie_name" ]] || movie_name="Unknown_Title_$(date +%Y%m%d_%H%M%S)"
+        local disc_label
+        disc_label="$(resolve_disc_label)"
+        [[ -n "$disc_label" ]] || disc_label="Unknown_Title_$(date +%Y%m%d_%H%M%S)"
+
+        if lookup_available; then
+            log "Looking up '$disc_label' on TMDb..."
+            if lookup_metadata movie "$disc_label"; then
+                movie_name="$LOOKUP_TITLE"
+                [[ -n "$LOOKUP_YEAR" ]] && movie_name="${movie_name} (${LOOKUP_YEAR})"
+            fi
+        fi
+
+        if [[ -z "$movie_name" ]]; then
+            read -r -p "Enter movie name (blank to use disc label '$disc_label'): " movie_name
+            [[ -n "$movie_name" ]] || movie_name="$disc_label"
+        fi
     fi
     local safe_name
     safe_name="$(sanitize "$movie_name")"
@@ -337,9 +429,23 @@ rip_tv() {
 
     local show_name="$NAME"
     if [[ -z "$show_name" ]]; then
-        show_name="$(resolve_disc_label)"
-        [[ -n "$show_name" ]] || die "Could not determine show name from disc label. Pass one explicitly with -n."
+        local disc_label
+        disc_label="$(resolve_disc_label)"
+
+        if [[ -n "$disc_label" ]] && lookup_available; then
+            log "Looking up '$disc_label' on TMDb..."
+            if lookup_metadata tv "$disc_label"; then
+                show_name="$LOOKUP_TITLE"
+                [[ -n "$LOOKUP_YEAR" ]] && show_name="${show_name} (${LOOKUP_YEAR})"
+            fi
+        fi
+
+        if [[ -z "$show_name" ]]; then
+            read -r -p "Enter show name (blank to use disc label '$disc_label'): " show_name
+            [[ -n "$show_name" ]] || show_name="$disc_label"
+        fi
     fi
+    [[ -n "$show_name" ]] || die "Could not determine show name from disc label. Pass one explicitly with -n."
     local safe_show
     safe_show="$(sanitize "$show_name")"
     [[ -n "$safe_show" ]] || die "Resulting show name is empty after sanitizing. Pass one explicitly with -n."

@@ -57,6 +57,7 @@ sudo apt-get install -y \
     udisks2 \
     util-linux \
     curl \
+    jq \
     software-properties-common
 
 if command -v makemkvcon >/dev/null 2>&1; then
@@ -78,6 +79,22 @@ else
     if confirm "Add user '$USER' to the 'cdrom' group (required for raw optical-drive access)?"; then
         sudo usermod -aG cdrom "$USER"
         warn "Group membership added. Log out and back in (or reboot) for it to take effect."
+    fi
+fi
+
+if [[ -z "${TMDB_API_KEY:-}" ]]; then
+    warn "No TMDB_API_KEY found in your environment."
+    echo "rip-disc.sh uses a free TMDb API key to look up movie/TV titles and years"
+    echo "for naming, instead of relying on the disc's raw volume label."
+    echo "Get one at: https://www.themoviedb.org/settings/api"
+    if confirm "Enter a TMDb API key now to save it in ~/.bashrc?"; then
+        read -r -p "TMDb API key: " api_key
+        if [[ -n "$api_key" ]]; then
+            printf '\nexport TMDB_API_KEY=%q\n' "$api_key" >> "$HOME/.bashrc"
+            log "Saved. Run 'source ~/.bashrc' or open a new terminal for it to take effect."
+        fi
+    else
+        warn "Skipping. rip-disc.sh will fall back to manual naming without a key (pass -K or export TMDB_API_KEY later)."
     fi
 fi
 
