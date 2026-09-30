@@ -94,7 +94,7 @@ MusicBrainz for artist/album/track metadata on every audio CD rip.
 ```bash
 ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
               [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS]
-              [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-k]
+              [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-y] [-E] [-k]
 ```
 
 | Flag | Meaning | Default |
@@ -109,6 +109,8 @@ MusicBrainz for artist/album/track metadata on every audio CD rip.
 | `-L` | Comma-separated subtitle language codes to include, if present (soft subs only, never burned in) | `eng` |
 | `-K` | TMDb API key (overrides the `TMDB_API_KEY` environment variable) | — |
 | `-M` | Disable TMDb metadata lookup even if a key is available | off |
+| `-y` | Non-interactive: auto-pick TMDb's top match and all titles in disc order instead of prompting | off |
+| `-E` | Disable auto-eject on completion | off (auto-eject is **on** by default) |
 | `-k` | Keep temporary raw MakeMKV rip files instead of deleting them | off |
 
 ### Examples
@@ -142,6 +144,12 @@ Skip TMDb lookup for this run and just prompt for a name manually:
 
 ```bash
 ./rip-disc.sh -M
+```
+
+Rip unattended (no prompts) and leave the disc in the drive afterward:
+
+```bash
+./rip-disc.sh -y -E
 ```
 
 ### TMDb title confirmation (movie/TV mode)
@@ -180,7 +188,64 @@ Enter the titles to rip as episodes, in episode order, space-separated
 
 After you pick (or accept the default disc order), it prints the resulting
 episode mapping and asks for a final `y/N` confirmation before ripping and
-encoding start.
+encoding start. Pass `-y` to skip both prompts and just use every scanned
+title in disc order (needed for unattended/automated runs — see below).
+
+## Automatic ripping / multi-drive setup
+
+For a dedicated ripping machine — e.g. several optical drives where you just
+want to load a disc, walk away, and have it show up in the library — run
+`./setup.sh` and say yes when it offers to install automatic ripping. This
+sets up:
+
+- A **udev rule** that detects when media is inserted into *any* `/dev/sr*`
+  drive (it matches on the "media present" event, so it doesn't re-trigger
+  when the drive later ejects on its own).
+- A **systemd service template** (`rip-disc@.service`) that the udev rule
+  starts per drive — `rip-disc@sr0.service`, `rip-disc@sr1.service`, etc. —
+  running `rip-disc.sh -d /dev/sr0 -y` as your user.
+
+Because it runs with `-y`, there are no prompts: TMDb lookups auto-accept
+the top match, TV-mode title selection auto-accepts disc order, and a
+missing match just falls back to the disc's volume label. Auto-detection
+still picks movie vs. music; TV discs ripped through automation are treated
+as movies unless you edit the systemd unit to add `-m tv -n "Show" -s N` for
+a given drive/disc run.
+
+When ripping finishes, the script **ejects the disc and opens the tray**
+(this is now the default for every run, not just automated ones — pass `-E`
+to keep the default off) so you can tell at a glance which drives are free
+to load the next disc.
+
+Useful commands once it's installed:
+
+```bash
+# Watch a specific drive's rip in real time
+journalctl -u rip-disc@sr0 -f
+
+# See what's currently running across all drives
+systemctl list-units 'rip-disc@*'
+
+# Change the saved TMDb key
+sudo nano /etc/rip-disc.env
+
+# Remove the automation entirely
+sudo rm /etc/udev/rules.d/99-rip-disc.rules /etc/systemd/system/rip-disc@.service /etc/rip-disc.env
+sudo udevadm control --reload-rules
+sudo systemctl daemon-reload
+```
+
+A few things worth knowing for an 8-drive-style setup:
+
+- Each drive's rip is fully independent — loading discs into multiple
+  drives at once starts multiple concurrent rips.
+- HandBrake's x265 encode is CPU-heavy; running many drives' encodes at
+  once on one machine will contend for CPU and slow every rip down
+  proportionally. There's no built-in concurrency limiter — if that
+  matters for your hardware, consider a systemd `CPUQuota=` / slice on
+  `rip-disc@.service`, or staggering how many drives you load at once.
+- If a rip fails partway, the disc is **not** ejected, so a stalled drive
+  is visibly still occupied — check `journalctl -u rip-disc@sr0` to see why.
 
 ## Adding to Jellyfin
 
@@ -207,3 +272,5 @@ what this script produces by default.
   will exit with an error.
 - TMDb/MusicBrainz lookups need internet access. If you're ripping offline,
   pass `-M` (or just decline the prompts) to name things manually.
+- Auto-eject on completion requires the `eject` package (installed by
+  `setup.sh`); pass `-E` to disable it for a given run.

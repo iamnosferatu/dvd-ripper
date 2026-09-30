@@ -58,6 +58,7 @@ sudo apt-get install -y \
     util-linux \
     curl \
     jq \
+    eject \
     software-properties-common
 
 if command -v makemkvcon >/dev/null 2>&1; then
@@ -91,7 +92,8 @@ if [[ -z "${TMDB_API_KEY:-}" ]]; then
         read -r -p "TMDb API key: " api_key
         if [[ -n "$api_key" ]]; then
             printf '\nexport TMDB_API_KEY=%q\n' "$api_key" >> "$HOME/.bashrc"
-            log "Saved. Run 'source ~/.bashrc' or open a new terminal for it to take effect."
+            log "Saved to ~/.bashrc. Run 'source ~/.bashrc' or open a new terminal for it to take effect."
+            SETUP_TMDB_API_KEY="$api_key"
         fi
     else
         warn "Skipping. rip-disc.sh will fall back to manual naming without a key (pass -K or export TMDB_API_KEY later)."
@@ -108,9 +110,66 @@ if [[ -f "${SCRIPT_DIR}/rip-disc.sh" ]]; then
     chmod +x "${SCRIPT_DIR}/rip-disc.sh"
 fi
 
+# ---------------------------------------------------------------------------
+# Optional: fully automatic ripping (udev + systemd), e.g. for a multi-drive
+# unattended ripping machine. Each optical drive gets its own service
+# instance (rip-disc@sr0.service, rip-disc@sr1.service, ...) started by udev
+# the moment media is detected in that drive, running rip-disc.sh -y so it
+# never blocks on a prompt. The script's own -E-less default (auto-eject on
+# completion) then opens the tray to signal the slot is free again.
+# ---------------------------------------------------------------------------
+AUTOMATION_NOTE=""
+if [[ ! -f "${SCRIPT_DIR}/rip-disc.sh" ]]; then
+    warn "rip-disc.sh not found next to setup.sh — skipping the automation offer."
+elif confirm "Set up fully automatic ripping (auto-start on disc insert, auto-eject on completion)?"; then
+    log "Installing udev rule and systemd service..."
+
+    sudo tee /etc/rip-disc.env >/dev/null <<EOF
+# Environment for rip-disc@*.service (systemd EnvironmentFile format: KEY=VALUE, no 'export').
+TMDB_API_KEY=${SETUP_TMDB_API_KEY:-}
+EOF
+    sudo chmod 600 /etc/rip-disc.env
+
+    sudo tee /etc/systemd/system/rip-disc@.service >/dev/null <<EOF
+[Unit]
+Description=Auto-rip disc in /dev/%i
+After=udisks2.service local-fs.target
+Wants=udisks2.service
+
+[Service]
+Type=oneshot
+User=${USER}
+EnvironmentFile=-/etc/rip-disc.env
+ExecStart=${SCRIPT_DIR}/rip-disc.sh -d /dev/%i -y
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=0
+EOF
+
+    sudo tee /etc/udev/rules.d/99-rip-disc.rules >/dev/null <<'EOF'
+# Auto-start rip-disc@<device>.service whenever media is inserted into an
+# optical drive. ID_CDROM_MEDIA=="1" only matches insertion, not ejection,
+# so this doesn't re-trigger when rip-disc.sh itself ejects on completion.
+ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA}=="1", TAG+="systemd", ENV{SYSTEMD_WANTS}="rip-disc@%k.service"
+EOF
+
+    sudo udevadm control --reload-rules
+    sudo systemctl daemon-reload
+
+    log "Automation installed."
+    AUTOMATION_NOTE="Automatic ripping is ON: insert a disc in any drive and it'll start ripping on its own."
+    echo "  - Check progress: journalctl -u rip-disc@sr0 -f   (replace sr0 with the drive)"
+    echo "  - Change TMDb key later: sudo nano /etc/rip-disc.env"
+    echo "  - Uninstall: sudo rm /etc/udev/rules.d/99-rip-disc.rules /etc/systemd/system/rip-disc@.service /etc/rip-disc.env && sudo udevadm control --reload-rules && sudo systemctl daemon-reload"
+else
+    AUTOMATION_NOTE="Automatic ripping is OFF: run './rip-disc.sh' manually per disc (rerun setup.sh to enable it later)."
+fi
+
 log "Setup complete."
 echo "  Movies    -> $HOME/Videos/Jellyfin/Movies"
 echo "  TV Shows  -> $HOME/Videos/Jellyfin/TV Shows"
 echo "  Music     -> $HOME/Music/Jellyfin"
+echo
+echo "$AUTOMATION_NOTE"
 echo
 echo "Run './rip-disc.sh' with a disc in the drive to get started."

@@ -10,7 +10,7 @@
 #
 # Requirements (Ubuntu):
 #   Run ./setup.sh to install everything automatically, or manually:
-#     sudo apt-get install -y handbrake-cli abcde cdparanoia flac cd-discid genisoimage udisks2 jq
+#     sudo apt-get install -y handbrake-cli abcde cdparanoia flac cd-discid genisoimage udisks2 jq eject
 #   MakeMKV: not in Ubuntu's official repos. setup.sh offers to add the
 #   community ppa:heyarje/makemkv-beta PPA, or install manually from
 #   https://www.makemkv.com/download/
@@ -25,10 +25,20 @@
 #   back to prompting for a manual name (same as before). Music mode already
 #   gets database-driven naming for free via MusicBrainz (through abcde).
 #
+# Unattended / multi-drive operation:
+#   Pass -y to disable every interactive prompt: TMDb matches auto-pick the
+#   top result, TV mode auto-accepts all titles above -l in disc order, and
+#   manual-name fallbacks just use the (sanitized) disc label. This is
+#   required when running from udev/systemd with no attached terminal — a
+#   `read` with no input would otherwise abort the script under `set -e`.
+#   See setup.sh for a udev+systemd installer that runs this automatically,
+#   per drive, whenever a disc is inserted — see the "automatic" section of
+#   the README for an 8-drive style batch ripping setup.
+#
 # Usage:
 #   ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
 #                 [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS]
-#                 [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-k]
+#                 [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-y] [-E] [-k]
 #
 #   -d DEVICE     Optical drive device (default: /dev/sr0)
 #   -m MODE       auto (default) | movie | tv | music
@@ -43,6 +53,10 @@
 #                 disc (default: eng). Soft subtitles only — never burned in.
 #   -K API_KEY    TMDb API key (overrides the TMDB_API_KEY environment variable)
 #   -M            Disable TMDb metadata lookup even if an API key is available
+#   -y            Non-interactive: auto-pick TMDb's top match / all titles in disc
+#                 order instead of prompting (required for udev/systemd triggering)
+#   -E            Disable auto-eject on completion (by default the tray opens
+#                 when the rip finishes, so you know the drive is free again)
 #   -k            Keep temporary raw-rip files instead of deleting them after encode
 #
 set -euo pipefail
@@ -62,6 +76,8 @@ MINLENGTH=120
 SUBTITLE_LANGS="eng"
 TMDB_API_KEY="${TMDB_API_KEY:-}"
 LOOKUP_DISABLED=0
+NONINTERACTIVE=0
+AUTO_EJECT=1
 KEEP_TEMP=0
 WORKDIR="$(mktemp -d /tmp/discrip.XXXXXX)"
 
@@ -97,7 +113,7 @@ sanitize() {
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-while getopts "d:m:n:s:o:q:l:L:K:Mkh" opt; do
+while getopts "d:m:n:s:o:q:l:L:K:MyEkh" opt; do
     case "$opt" in
         d) DEVICE="$OPTARG" ;;
         m) MODE="$OPTARG" ;;
@@ -109,6 +125,8 @@ while getopts "d:m:n:s:o:q:l:L:K:Mkh" opt; do
         L) SUBTITLE_LANGS="$OPTARG" ;;
         K) TMDB_API_KEY="$OPTARG" ;;
         M) LOOKUP_DISABLED=1 ;;
+        y) NONINTERACTIVE=1 ;;
+        E) AUTO_EJECT=0 ;;
         k) KEEP_TEMP=1 ;;
         h) usage ;;
         *) usage ;;
@@ -196,6 +214,13 @@ lookup_metadata() {
     fi
     [[ "$count" -gt 8 ]] && count=8
 
+    if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+        LOOKUP_TITLE="$(echo "$resp" | jq -r ".results[0].${title_field}")"
+        LOOKUP_YEAR="$(echo "$resp" | jq -r ".results[0].${year_field} // \"\"" | cut -c1-4)"
+        log "Non-interactive: auto-picked top TMDb match '$LOOKUP_TITLE (${LOOKUP_YEAR:-unknown year})' for '$query'."
+        return 0
+    fi
+
     echo
     echo "TMDb matches for '$query':"
     local i t y
@@ -246,6 +271,7 @@ EOF
     abcde -N -d "$DEVICE" -c "$abcde_conf"
 
     log "Music rip complete. Point a Jellyfin Music library at: $output_root"
+    eject_disc
 }
 
 # ---------------------------------------------------------------------------
@@ -298,26 +324,31 @@ show_titles() {
 }
 
 # Interactively confirm which titles become which episodes, in what order.
-# Populates the global SELECTED_TITLES array.
+# Populates the global SELECTED_TITLES array. In -y (non-interactive) mode,
+# skips all prompts and uses every scanned title in disc order.
 confirm_episode_selection() {
     show_titles
 
-    echo
-    echo "Enter the titles to rip as episodes, in episode order, space-separated"
-    echo "(e.g. '0 1 2 4'), or press Enter to use all titles above in disc order."
-    read -r -p "> " selection
-
-    if [[ -z "$selection" ]]; then
+    if [[ "$NONINTERACTIVE" -eq 1 ]]; then
         SELECTED_TITLES=("${TITLE_IDS[@]}")
     else
-        # shellcheck disable=SC2206
-        SELECTED_TITLES=($selection)
-        local id valid
-        for id in "${SELECTED_TITLES[@]}"; do
-            valid=0
-            for t in "${TITLE_IDS[@]}"; do [[ "$t" == "$id" ]] && valid=1 && break; done
-            [[ "$valid" -eq 1 ]] || die "Title '$id' is not on this disc."
-        done
+        echo
+        echo "Enter the titles to rip as episodes, in episode order, space-separated"
+        echo "(e.g. '0 1 2 4'), or press Enter to use all titles above in disc order."
+        read -r -p "> " selection
+
+        if [[ -z "$selection" ]]; then
+            SELECTED_TITLES=("${TITLE_IDS[@]}")
+        else
+            # shellcheck disable=SC2206
+            SELECTED_TITLES=($selection)
+            local id valid
+            for id in "${SELECTED_TITLES[@]}"; do
+                valid=0
+                for t in "${TITLE_IDS[@]}"; do [[ "$t" == "$id" ]] && valid=1 && break; done
+                [[ "$valid" -eq 1 ]] || die "Title '$id' is not on this disc."
+            done
+        fi
     fi
 
     local season_padded
@@ -332,9 +363,20 @@ confirm_episode_selection() {
             "$season_padded" "$ep" "$id" "${TITLE_DURATION[$id]:-?}" "${TITLE_CHAPTERS[$id]:-?}"
     done
 
+    if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+        log "Non-interactive: proceeding with the mapping above."
+        return
+    fi
+
     echo
     read -r -p "Proceed with this mapping? [y/N] " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || die "Aborted by user — rerun and adjust the title selection."
+}
+
+eject_disc() {
+    [[ "$AUTO_EJECT" -eq 1 ]] || return 0
+    log "Ejecting $DEVICE..."
+    eject "$DEVICE" 2>/dev/null || warn "Failed to eject $DEVICE — you may need to remove the disc manually."
 }
 
 encode_one() {
@@ -379,8 +421,13 @@ rip_movie() {
         fi
 
         if [[ -z "$movie_name" ]]; then
-            read -r -p "Enter movie name (blank to use disc label '$disc_label'): " movie_name
-            [[ -n "$movie_name" ]] || movie_name="$disc_label"
+            if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+                movie_name="$disc_label"
+                log "Non-interactive: using disc label '$movie_name' (no TMDb match)."
+            else
+                read -r -p "Enter movie name (blank to use disc label '$disc_label'): " movie_name
+                [[ -n "$movie_name" ]] || movie_name="$disc_label"
+            fi
         fi
     fi
     local safe_name
@@ -419,6 +466,7 @@ rip_movie() {
     done
 
     log "All done. Point Jellyfin's Movies library at: $output_root"
+    eject_disc
 }
 
 # ---------------------------------------------------------------------------
@@ -441,8 +489,13 @@ rip_tv() {
         fi
 
         if [[ -z "$show_name" ]]; then
-            read -r -p "Enter show name (blank to use disc label '$disc_label'): " show_name
-            [[ -n "$show_name" ]] || show_name="$disc_label"
+            if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+                show_name="$disc_label"
+                log "Non-interactive: using disc label '$show_name' (no TMDb match)."
+            else
+                read -r -p "Enter show name (blank to use disc label '$disc_label'): " show_name
+                [[ -n "$show_name" ]] || show_name="$disc_label"
+            fi
         fi
     fi
     [[ -n "$show_name" ]] || die "Could not determine show name from disc label. Pass one explicitly with -n."
@@ -489,12 +542,16 @@ rip_tv() {
     done
 
     log "All done. Point Jellyfin's TV Shows library at: $output_root"
+    eject_disc
 }
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 command -v blkid >/dev/null 2>&1 || die "'blkid' not found (should ship with util-linux)."
+if [[ "$AUTO_EJECT" -eq 1 ]]; then
+    command -v eject >/dev/null 2>&1 || die "'eject' not found. Install with: sudo apt-get install -y eject (or pass -E to skip auto-eject)."
+fi
 
 RESOLVED_MODE="$MODE"
 if [[ "$MODE" == "auto" ]]; then
