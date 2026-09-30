@@ -267,6 +267,88 @@ A few things worth knowing for an 8-drive-style setup:
 - If a rip fails partway, the disc is **not** ejected, so a stalled drive
   is visibly still occupied — check `journalctl -u rip-disc@sr0` to see why.
 
+### Walkthrough: loading all 8 drives at once
+
+Say drive 1 has a TV series, drives 2–7 have movies, and drive 8 has a
+music CD. Do you need to start 8 scripts by hand, or can you set it all off
+at once?
+
+**If the udev/systemd automation is installed:** 7 of the 8 drives need
+zero manual commands — load discs and close the trays. Each drive
+independently fires its own `rip-disc@srN.service` the instant its media
+becomes readable:
+
+- **Drives 2–7 (movies):** auto-detected as DVD-Video → movie mode. Each
+  rips its main feature, looks up the title on TMDb (auto-picking the top
+  match since `-y` is baked into the automated path), then **ejects as
+  soon as the rip finishes** — likely within minutes of each other, well
+  before any encoding is done.
+- **Drive 8 (music CD):** auto-detected as an audio CD (no filesystem + a
+  readable audio TOC) → music mode. `abcde` rips and tags it via
+  MusicBrainz, then ejects when done — usually the fastest of the eight.
+- **Drive 1 (TV series):** also auto-detected as DVD-Video, so — this is
+  the one catch — automation defaults it to **movie mode too**, meaning
+  it would rip only the main/longest title instead of every episode.
+  Nothing at the filesystem level distinguishes a TV disc from a movie
+  disc, so this one genuinely needs you to say so.
+
+For the TV drive, two options:
+
+1. **One-off override** — the moment you know sr0 has a TV disc, stop the
+   auto-triggered job and run it manually:
+   ```bash
+   sudo systemctl stop rip-disc@sr0.service
+   ./rip-disc.sh -d /dev/sr0 -m tv -n "Show Name" -s 1
+   ```
+   (drop `-y` to eyeball the episode-title mapping first; keep it to trust
+   disc order).
+
+2. **Standing override**, if one particular physical drive is *always*
+   your TV-ripping drive:
+   ```bash
+   sudo systemctl edit rip-disc@sr0.service
+   ```
+   ```ini
+   [Service]
+   ExecStart=
+   ExecStart=/path/to/rip-disc.sh -d /dev/sr0 -m tv -y
+   ```
+   (the empty `ExecStart=` clears the template's default before setting
+   your override). You'd still want per-show `-n`/`-s` values, so this
+   suits a recurring setup more than a one-off mixed batch like this
+   example.
+
+Meanwhile, encoding is the CPU-bound step everything funnels into: with
+the default `-j 2`, only 2 encodes run at a time *across all 8 drives*.
+Realistically, all 8 rips proceed in parallel and finish (and eject)
+within minutes of each other; the 8 raw files then queue up and get
+encoded 2-at-a-time in the background — drives are free to reload long
+before encoding catches up.
+
+Watch it all from one terminal:
+
+```bash
+journalctl -u 'rip-disc@*' -f          # live log across every drive
+systemctl list-units 'rip-disc@*'      # which instances are running/done/failed
+```
+
+**If you haven't installed the automation:** fire all 8 at once manually
+from one shell, backgrounding each and redirecting logs so they don't
+interleave on your terminal:
+
+```bash
+./rip-disc.sh -d /dev/sr0 -m tv -n "Show Name" -s 1 -y > /tmp/sr0.log 2>&1 &
+for i in 1 2 3 4 5 6 7; do
+    ./rip-disc.sh -d /dev/sr$i -y > /tmp/sr$i.log 2>&1 &
+done
+wait
+```
+
+Drive 8 doesn't need `-m music` explicitly — auto-detect handles the audio
+CD correctly on its own, same as the movie drives. `wait` blocks your
+terminal until all 8 background jobs finish; drop it to get your prompt
+back immediately and check progress with `tail -f /tmp/sr*.log` instead.
+
 ## Adding to Jellyfin
 
 Point Jellyfin libraries at the output roots (or subfolders):
