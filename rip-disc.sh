@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 #
-# rip-disc.sh — Rip a DVD (movie or TV) or audio CD into a Jellyfin-ready library.
+# rip-disc.sh — Rip a DVD/Blu-ray (movie or TV) or audio CD into a
+# Jellyfin-ready library.
 #
 # Auto-detects what's in the drive and routes to the right pipeline:
-#   Audio CD    -> abcde (cdparanoia + FLAC + MusicBrainz tagging)
-#   DVD, movie  -> MakeMKV (main feature) -> HandBrakeCLI (H.265 encode)
-#   DVD, TV     -> MakeMKV title scan -> interactive confirmation of which
-#                  titles map to which episodes -> HandBrakeCLI, named S01E01...
+#   Audio CD        -> abcde (cdparanoia + FLAC + MusicBrainz tagging)
+#   DVD/Blu-ray, movie -> MakeMKV (main feature) -> HandBrakeCLI (H.265 encode)
+#   DVD/Blu-ray, TV    -> MakeMKV title scan -> interactive confirmation of
+#                         which titles map to which episodes -> HandBrakeCLI,
+#                         named S01E01...
+#
+# For a video disc, auto mode asks "Movie or TV show?" (and, for TV, the
+# season number) unless -y or an explicit -m is given — see "Unattended /
+# multi-drive operation" below for how to skip this on automated drives.
 #
 # Requirements (Ubuntu):
 #   Run ./setup.sh to install everything automatically, or manually:
@@ -171,16 +177,17 @@ detect_disc_type() {
         die "Could not identify disc: no filesystem and no audio TOC found. Is a disc inserted?"
     fi
 
-    # Filesystem present (UDF/ISO9660) -> DVD-Video or data disc. Mount to check for VIDEO_TS.
+    # Filesystem present (UDF/ISO9660) -> DVD-Video, Blu-ray, or data disc.
+    # Mount to check for VIDEO_TS (DVD) or BDMV (Blu-ray).
     local udisk_out
     udisk_out="$(udisksctl mount -b "$DEVICE" 2>&1)" || die "Failed to mount $DEVICE: $udisk_out"
     MOUNT_POINT="$(echo "$udisk_out" | sed -n "s/.*at \(.*\)\.$/\1/p")"
     MOUNTED_BY_US=1
 
-    if [[ -d "${MOUNT_POINT}/VIDEO_TS" ]]; then
+    if [[ -d "${MOUNT_POINT}/VIDEO_TS" || -d "${MOUNT_POINT}/BDMV" ]]; then
         echo "video"
     else
-        die "Disc at $DEVICE doesn't look like a DVD-Video or audio CD (no VIDEO_TS, no audio TOC). Data discs aren't supported by this script."
+        die "Disc at $DEVICE doesn't look like a DVD-Video/Blu-ray disc or audio CD (no VIDEO_TS or BDMV, no audio TOC). Data discs aren't supported by this script."
     fi
 }
 
@@ -651,16 +658,34 @@ if [[ "$MODE" == "auto" ]]; then
     log "Detecting disc type in $DEVICE..."
     disc_type="$(detect_disc_type)"
     case "$disc_type" in
-        music) RESOLVED_MODE="music" ;;
-        video) RESOLVED_MODE="movie" ;;
+        music)
+            RESOLVED_MODE="music"
+            log "Detected: audio CD -> mode 'music'"
+            ;;
+        video)
+            if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+                RESOLVED_MODE="movie"
+                log "Detected: video disc -> mode 'movie' (non-interactive; pass -m tv explicitly for TV discs)"
+            else
+                echo
+                read -r -p "Video disc detected. Is this a Movie or a TV show? [M/t] " mode_reply
+                if [[ "$mode_reply" =~ ^[Tt]$ ]]; then
+                    RESOLVED_MODE="tv"
+                    read -r -p "Season number [${SEASON}]: " season_reply
+                    [[ -n "$season_reply" ]] && SEASON="$season_reply"
+                else
+                    RESOLVED_MODE="movie"
+                fi
+                log "Mode: $RESOLVED_MODE"
+            fi
+            ;;
     esac
-    log "Detected: $disc_type -> mode '$RESOLVED_MODE' (pass -m tv explicitly if this is a TV disc)"
 else
     if [[ "$MODE" == "movie" || "$MODE" == "tv" ]]; then
         # Still need to mount to sanity-check it's actually a video disc, and
         # to read the label if -n wasn't given.
         fs_type="$(blkid -o value -s TYPE "$DEVICE" 2>/dev/null || true)"
-        [[ -n "$fs_type" ]] || die "No filesystem detected on $DEVICE — this doesn't look like a DVD-Video disc."
+        [[ -n "$fs_type" ]] || die "No filesystem detected on $DEVICE — this doesn't look like a DVD-Video/Blu-ray disc."
     fi
 fi
 
