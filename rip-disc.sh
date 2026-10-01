@@ -74,6 +74,12 @@
 #   -E            Disable auto-eject on completion (by default the tray opens
 #                 when the rip finishes, so you know the drive is free again)
 #   -j N          Max concurrent HandBrake encodes system-wide (default: 2; 0 = unlimited)
+#   -H            Hardware-encode with Intel Quick Sync (qsv_h265) instead of
+#                 software x265. Much faster, but typically less efficient
+#                 compression at the same quality (bigger files). Needs
+#                 HandBrakeCLI built with QSV/oneVPL support and the Intel
+#                 media driver installed (setup.sh offers this) — the script
+#                 verifies the encoder is actually available before ripping.
 #   -k            Keep temporary raw-rip files instead of deleting them after encode
 #
 set -euo pipefail
@@ -96,6 +102,7 @@ LOOKUP_DISABLED=0
 NONINTERACTIVE=0
 AUTO_EJECT=1
 MAX_ENCODES=2
+HW_ENCODE=0
 KEEP_TEMP=0
 WORKDIR="$(mktemp -d /tmp/discrip.XXXXXX)"
 
@@ -131,7 +138,7 @@ sanitize() {
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-while getopts "d:m:n:s:o:q:l:L:K:MyEj:kh" opt; do
+while getopts "d:m:n:s:o:q:l:L:K:MyEj:Hkh" opt; do
     case "$opt" in
         d) DEVICE="$OPTARG" ;;
         m) MODE="$OPTARG" ;;
@@ -146,6 +153,7 @@ while getopts "d:m:n:s:o:q:l:L:K:MyEj:kh" opt; do
         y) NONINTERACTIVE=1 ;;
         E) AUTO_EJECT=0 ;;
         j) MAX_ENCODES="$OPTARG" ;;
+        H) HW_ENCODE=1 ;;
         k) KEEP_TEMP=1 ;;
         h) usage ;;
         *) usage ;;
@@ -460,27 +468,56 @@ release_encode_slot() {
     ENCODE_SLOT_FD=""
 }
 
+# Checked once, lazily, the first time encode_one() needs it.
+HW_ENCODE_CHECKED=0
+
+check_hw_encode() {
+    [[ "$HW_ENCODE_CHECKED" -eq 1 ]] && return 0
+    HW_ENCODE_CHECKED=1
+    HandBrakeCLI --help 2>&1 | grep -q 'qsv_h265' || die \
+        "Hardware encoding (-H) requested, but this HandBrakeCLI build has no qsv_h265 encoder. It needs to be built with Intel QSV/oneVPL support, and the Intel media driver installed — see setup.sh's optional Quick Sync step, or drop -H to use software x265."
+}
+
 encode_one() {
     local raw="$1" final_path="$2"
 
     acquire_encode_slot
-    HandBrakeCLI \
-        --input "$raw" \
-        --output "$final_path" \
-        --encoder x265 \
-        --quality "$QUALITY" \
-        --encoder-preset medium \
-        --all-audio \
-        --aencoder copy:ac3,copy:dts,av_aac \
-        --audio-fallback av_aac \
-        --all-subtitles \
-        --subtitle-lang-list "$SUBTITLE_LANGS" \
-        --subtitle-burned=none \
-        --markers \
-        --optimize \
-        --format av_mkv \
-        --two-pass \
-        --turbo
+    if [[ "$HW_ENCODE" -eq 1 ]]; then
+        check_hw_encode
+        HandBrakeCLI \
+            --input "$raw" \
+            --output "$final_path" \
+            --encoder qsv_h265 \
+            --quality "$QUALITY" \
+            --encoder-preset quality \
+            --all-audio \
+            --aencoder copy:ac3,copy:dts,av_aac \
+            --audio-fallback av_aac \
+            --all-subtitles \
+            --subtitle-lang-list "$SUBTITLE_LANGS" \
+            --subtitle-burned=none \
+            --markers \
+            --optimize \
+            --format av_mkv
+    else
+        HandBrakeCLI \
+            --input "$raw" \
+            --output "$final_path" \
+            --encoder x265 \
+            --quality "$QUALITY" \
+            --encoder-preset medium \
+            --all-audio \
+            --aencoder copy:ac3,copy:dts,av_aac \
+            --audio-fallback av_aac \
+            --all-subtitles \
+            --subtitle-lang-list "$SUBTITLE_LANGS" \
+            --subtitle-burned=none \
+            --markers \
+            --optimize \
+            --format av_mkv \
+            --two-pass \
+            --turbo
+    fi
     release_encode_slot
 }
 

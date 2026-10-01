@@ -74,6 +74,27 @@ else
     fi
 fi
 
+if confirm "Install Intel Quick Sync (QSV) hardware video-encoding support (for rip-disc.sh -H)?"; then
+    log "Installing the Intel media driver and QSV runtime..."
+    sudo apt-get install -y intel-media-va-driver-non-free vainfo || \
+        warn "Could not install intel-media-va-driver-non-free — Quick Sync support may be unavailable on this system/Ubuntu release."
+
+    for grp in video render; do
+        if id -nG "$USER" | grep -qw "$grp"; then
+            log "User '$USER' is already in the '$grp' group."
+        elif confirm "Add user '$USER' to the '$grp' group (needed for /dev/dri access)?"; then
+            sudo usermod -aG "$grp" "$USER"
+            warn "Group membership added. Log out and back in (or reboot) for it to take effect."
+        fi
+    done
+
+    if command -v HandBrakeCLI >/dev/null 2>&1 && HandBrakeCLI --help 2>&1 | grep -q qsv_h265; then
+        log "HandBrakeCLI reports qsv_h265 is available."
+    else
+        warn "HandBrakeCLI doesn't list qsv_h265 as an encoder. The apt-packaged handbrake-cli build on this Ubuntu release may not include QSV/oneVPL support — -H won't work until that's resolved (building HandBrake from source with QSV enabled is the usual fix)."
+    fi
+fi
+
 if id -nG "$USER" | grep -qw cdrom; then
     log "User '$USER' is already in the 'cdrom' group."
 else

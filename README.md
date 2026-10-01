@@ -103,7 +103,7 @@ MusicBrainz for artist/album/track metadata on every audio CD rip.
 ```bash
 ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
               [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS]
-              [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-y] [-E] [-j N] [-k]
+              [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-y] [-E] [-j N] [-H] [-k]
 ```
 
 | Flag | Meaning | Default |
@@ -113,7 +113,7 @@ MusicBrainz for artist/album/track metadata on every audio CD rip.
 | `-n` | Movie title (`"Name (Year)"`) or TV show name — skips TMDb lookup entirely | disc label / TMDb match |
 | `-s` | Season number (TV mode only) | `1` |
 | `-o` | Library root; `Movies/`, `TV Shows/`, `Music/` subfolders are created under it | `~/Videos/Jellyfin` (video) / `~/Music/Jellyfin` (audio) |
-| `-q` | x265 CRF for video encodes — lower = higher quality/bigger file | `20` |
+| `-q` | Encode quality (x265 CRF, or QSV ICQ with `-H`) — lower = higher quality/bigger file | `20` |
 | `-l` | Minimum title length in seconds for MakeMKV to keep (movie mode) | `120` |
 | `-L` | Comma-separated subtitle language codes to include, if present (soft subs only, never burned in) | `eng` |
 | `-K` | TMDb API key (overrides the `TMDB_API_KEY` environment variable) | — |
@@ -121,6 +121,7 @@ MusicBrainz for artist/album/track metadata on every audio CD rip.
 | `-y` | Non-interactive: auto-pick TMDb's top match and all titles in disc order instead of prompting | off |
 | `-E` | Disable auto-eject on completion | off (auto-eject is **on** by default) |
 | `-j` | Max simultaneous HandBrake encodes, system-wide across all drives (`0` = unlimited) | `2` |
+| `-H` | Hardware-encode with Intel Quick Sync (`qsv_h265`) instead of software x265 — much faster, somewhat less efficient compression | off (software x265) |
 | `-k` | Keep temporary raw MakeMKV rip files instead of deleting them | off |
 
 ### Examples
@@ -168,6 +169,40 @@ high-core-count machine):
 ```bash
 ./rip-disc.sh -j 4
 ```
+
+Hardware-encode with Intel Quick Sync instead of software x265:
+
+```bash
+./rip-disc.sh -H
+```
+
+### Hardware encoding with Intel Quick Sync (`-H`)
+
+By default, video is encoded with software x265 — this gives the best
+compression efficiency (smallest file for a given quality) but is slow:
+expect a rip to take noticeably longer than the movie's own runtime, even
+on a decent CPU. If your machine has an Intel CPU with Quick Sync (most
+Intel CPUs from roughly the last decade, including low-power T-series
+chips), `-H` switches to hardware HEVC encoding instead, which is dramatically
+faster — often close to real-time — at the cost of somewhat larger files
+for the same visual quality (hardware encoders trade some compression
+efficiency for speed).
+
+Requirements:
+
+- HandBrakeCLI needs to have been built with QSV/oneVPL support. Ubuntu's
+  apt-packaged `handbrake-cli` doesn't always include this — `rip-disc.sh`
+  checks for a `qsv_h265` encoder before using `-H` and refuses with a clear
+  error if it isn't available, rather than silently falling back.
+- The Intel media driver (`intel-media-va-driver-non-free`) needs to be
+  installed, and your user needs access to `/dev/dri` (the `video`/`render`
+  groups). `setup.sh` offers to handle both.
+
+On a multi-drive machine, keep in mind Quick Sync is a single shared
+hardware block per machine (unlike software encoding, which scales across
+CPU cores) — running many `-H` encodes at once via a high `-j` value may
+not actually go any faster than a lower one, since they're contending for
+the same encode engine rather than separate cores.
 
 ### TMDb title confirmation (movie/TV mode)
 
