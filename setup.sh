@@ -59,6 +59,7 @@ sudo apt-get install -y \
     curl \
     jq \
     eject \
+    ffmpeg \
     software-properties-common
 
 if command -v makemkvcon >/dev/null 2>&1; then
@@ -119,6 +120,28 @@ if [[ -z "${TMDB_API_KEY:-}" ]]; then
     else
         warn "Skipping. rip-disc.sh will fall back to manual naming without a key (pass -K or export TMDB_API_KEY later)."
     fi
+fi
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rip-disc"
+CONFIG_FILE="${CONFIG_DIR}/config"
+if [[ -f "$CONFIG_FILE" ]]; then
+    log "Config file already exists, leaving it alone: $CONFIG_FILE"
+else
+    ENCODE_DEFAULT=0
+    if [[ "$ASSUME_YES" -eq 0 ]] && confirm "Encode automatically after every rip by default? (No = rip-only to .mkv; encode later with './rip-disc.sh -m encode')"; then
+        ENCODE_DEFAULT=1
+    fi
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+# rip-disc.sh defaults (plain shell assignments; command-line flags override these).
+# Encode right after ripping (1) or rip-only, encode later with -m encode (0):
+ENCODE_AFTER_RIP=${ENCODE_DEFAULT}
+# GB of free space to keep beyond each job's estimated need (0 disables the guard):
+MIN_FREE_GB=10
+# QUALITY=20
+# HW_ENCODE=0
+EOF
+    log "Wrote $CONFIG_FILE (ENCODE_AFTER_RIP=${ENCODE_DEFAULT}). Edit it any time."
 fi
 
 log "Creating Jellyfin library directories..."

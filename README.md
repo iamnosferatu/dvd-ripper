@@ -9,8 +9,8 @@ pipeline:
 | Disc type        | Pipeline                                                        | Output layout |
 |-------------------|------------------------------------------------------------------|---------------|
 | Audio CD          | `cdparanoia` + `flac` + MusicBrainz tagging via `abcde`          | `Music/Artist/Album/## - Track.flac` |
-| DVD/Blu-ray, movie | MakeMKV (main feature) → HandBrakeCLI (H.265/x265 encode)         | `Movies/Name (Year)/Name (Year).mkv` |
-| DVD/Blu-ray, TV    | MakeMKV title scan → interactive episode confirmation → HandBrakeCLI | `TV Shows/Show/Season 01/Show - S01E01.mkv` |
+| DVD/Blu-ray, movie | MakeMKV (main feature), lossless; HandBrakeCLI encode is opt-in    | `Movies/Name (Year)/Name (Year).mkv` |
+| DVD/Blu-ray, TV    | MakeMKV title scan → interactive episode confirmation; encode opt-in | `TV Shows/Show/Season 01/Show - S01E01.mkv` |
 
 Auto-detection can reliably tell an audio CD from a DVD/Blu-ray video disc,
 but it can't tell a movie disc from a TV disc (both look the same at the
@@ -103,17 +103,18 @@ MusicBrainz for artist/album/track metadata on every audio CD rip.
 ```bash
 ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
               [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS]
-              [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-y] [-E] [-j N] [-H] [-k]
+              [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-y] [-E] [-j N] [-H]
+              [-e|-r] [-f GB] [FILE...]
 ```
 
 | Flag | Meaning | Default |
 |------|---------|---------|
 | `-d` | Optical drive device | `/dev/sr0` |
-| `-m` | Mode: `auto`, `movie`, `tv`, `music` | `auto` |
+| `-m` | Mode: `auto`, `movie`, `tv`, `music`, or `encode` (encode raw rips already in the library — no disc needed) | `auto` |
 | `-n` | Movie title (`"Name (Year)"`) or TV show name — skips TMDb lookup entirely | disc label / TMDb match |
 | `-s` | Season number (TV mode only) | `1` |
 | `-o` | Library root; `Movies/`, `TV Shows/`, `Music/` subfolders are created under it | `~/Videos/Jellyfin` (video) / `~/Music/Jellyfin` (audio) |
-| `-q` | Encode quality (x265 CRF, or QSV ICQ with `-H`) — lower = higher quality/bigger file | `20` |
+| `-q` | Encode quality (x265 CRF, or QSV ICQ with `-H`) — lower = higher quality/bigger file; only matters when encoding | `20` |
 | `-l` | Minimum title length in seconds for MakeMKV to keep (movie mode) | `120` |
 | `-L` | Comma-separated subtitle language codes to include, if present (soft subs only, never burned in) | `eng` |
 | `-K` | TMDb API key (overrides the `TMDB_API_KEY` environment variable) | — |
@@ -122,7 +123,76 @@ MusicBrainz for artist/album/track metadata on every audio CD rip.
 | `-E` | Disable auto-eject on completion | off (auto-eject is **on** by default) |
 | `-j` | Max simultaneous HandBrake encodes, system-wide across all drives (`0` = unlimited) | `2` |
 | `-H` | Hardware-encode with Intel Quick Sync (`qsv_h265`) instead of software x265 — much faster, somewhat less efficient compression | off (software x265) |
-| `-k` | Keep temporary raw MakeMKV rip files instead of deleting them | off |
+| `-e` | Encode right after the rip | off (rip-only) unless `ENCODE_AFTER_RIP=1` in the config file |
+| `-r` | Rip only — overrides `ENCODE_AFTER_RIP=1` from the config file | — |
+| `-f` | Free-space headroom in GB to keep beyond each job's estimated need (`0` disables the free-space guard) | `10` |
+
+### Rip now, encode later (default)
+
+To save time, the default is **rip-only**: video discs are ripped by MakeMKV
+straight to their final Jellyfin name — a lossless copy with every audio
+track and subtitle — verified, and the disc is ejected. Nothing is
+re-encoded unless you ask for it. The raw `.mkv` is playable in Jellyfin
+immediately.
+
+- **Marker files.** Each raw rip gets a small sidecar, `Name (Year).mkv.raw`,
+  which is how the script knows it hasn't been encoded yet (Jellyfin ignores
+  it).
+- **Encode right after ripping:** pass `-e` for one run, or set a global
+  default in `~/.config/rip-disc/config` (override the path with
+  `RIP_DISC_CONFIG`; `setup.sh` offers to create it):
+  ```bash
+  ENCODE_AFTER_RIP=1   # 0 = rip-only (default)
+  MIN_FREE_GB=10
+  # QUALITY=20
+  # HW_ENCODE=0
+  ```
+  The systemd automation reads this too (it runs as your user), so changing
+  the file changes every drive's behaviour with no unit edits. `-e` / `-r`
+  on the command line always win. Interactive runs with neither flag ask
+  **"Encode after ripping?"** per disc (defaulting to the config value) —
+  that includes the reserved sr0 console.
+- **Encode later:** `./rip-disc.sh -m encode` needs no disc or drive. It
+  scans the library for `.raw` markers and lists what's pending:
+  ```
+    #    Size      Duration   File
+    --   ----      --------   ----
+    1    5.8GiB    1:52:10    Movies/Blade Runner (1982)/Blade Runner (1982).mkv
+    2    31.2GiB   2:03:44    Movies/Heat (1995)/Heat (1995).mkv
+
+  Select files to encode (e.g. '1 3 5-7' or 'all'; Enter to cancel):
+  ```
+  Pick numbers, ranges or `all`, confirm, and it encodes them using your
+  `-q`, `-H`, `-j` and `-L` settings. `./rip-disc.sh -m encode -y` encodes
+  everything pending without asking (handy overnight), and you can pass
+  explicit paths: `./rip-disc.sh -m encode "Movies/Heat (1995)/Heat (1995).mkv"`.
+- **Safe replacement.** An encode is written to a hidden scratch folder
+  (`<library>/.rip-tmp`, which Jellyfin never scans), checked with ffprobe
+  (video + audio present, duration within 2% of the source), and only then
+  moved over the raw file and the marker removed. If anything fails, the raw
+  file and its marker are left exactly as they were.
+- **Integrity check on every rip.** Before a rip is moved into the library it
+  must have video and audio streams and not be shorter than expected (95% of
+  the duration MakeMKV reported for TV titles; at least `-l` seconds for
+  movies). A rip that fails is renamed `Name.mkv.failed` (ignored by
+  Jellyfin) and the disc is **not** ejected, so a bad disc stays visibly
+  stuck in its drive.
+- **Never overwrites.** If `Name (Year).mkv` already exists the rip refuses
+  to start (disc stays in the drive) — remove it or pick another name with `-n`.
+
+### Free-space guard
+
+With 8 drives ripping at once it's easy to fill the disk, so before each rip
+the script reserves about the disc's size (read from the drive; 25 GB if it
+can't tell) plus `-f` GB of headroom against the library's filesystem. The
+reservation counts what other in-flight rips and encodes have already
+claimed (shared via a lock in `/tmp`, so simultaneous starts can't
+double-book the same free space). If there isn't room it refuses to start —
+printing how short it is — and leaves the disc in the drive. Encodes reserve
+about half the raw file's size for the new file. Set `-f 0` (or
+`MIN_FREE_GB=0`) to turn the guard off. The estimate is deliberately
+conservative: a DVD rips to well under its disc size, and a space check that
+refuses early beats one that fails 40 GB into a Blu-ray.
 
 ### Examples
 
@@ -161,6 +231,18 @@ Rip unattended (no prompts) and leave the disc in the drive afterward:
 
 ```bash
 ./rip-disc.sh -y -E
+```
+
+Rip and then encode in one go (instead of the rip-only default):
+
+```bash
+./rip-disc.sh -e
+```
+
+Encode raw rips you pick later (software x265, or add `-H` for Quick Sync):
+
+```bash
+./rip-disc.sh -m encode
 ```
 
 Allow up to 4 simultaneous encodes instead of the default 2 (e.g. on a
@@ -286,14 +368,12 @@ This is the recommended way to dedicate one drive to TV box sets, Blu-ray
 discs, or anything else you'd rather decide on a case-by-case basis, while
 still running the rest of the machine completely hands-off.
 
-The disc is ejected **as soon as its raw MakeMKV rip is done — not after
+The disc is ejected **as soon as its rip is verified — never after
 encoding** (this is the default for every run, not just automated ones;
-pass `-E` to disable it). Once the rip is sitting in a local temp file, the
-encode step never touches the drive again, so there's no reason to keep the
-disc in longer than that: a drive's turnaround is its rip time, not
-rip+encode time, even while its encode is still queued behind `-j` on other
-drives. This is what actually lets an 8-drive setup keep moving — drives
-free up fast, while a handful of encodes churn through the backlog.
+pass `-E` to disable it). With rip-only as the default there's no encode
+step holding anything up at all: a drive's turnaround is just its rip time,
+and the raw files wait in your library until you choose to encode them (or,
+with `ENCODE_AFTER_RIP=1`, until a `-j` encode slot frees up).
 
 Useful commands once it's installed:
 
@@ -318,20 +398,21 @@ A few things worth knowing for an 8-drive-style setup:
 - Each drive's MakeMKV rip is fully independent and uncapped — it's disc
   I/O, not CPU, so all 8 drives can be reading discs at once with no
   contention.
-- HandBrake's x265 encode is the CPU-heavy step, so it's gated by `-j`
-  (default **2** simultaneous encodes, system-wide, regardless of how many
-  drives are active). A drive that finishes ripping while the encode
-  slots are full just waits its turn — its raw rip sits in a temp
-  directory until a slot frees up, then it encodes and ejects. `setup.sh`
-  asks for this limit when installing the automation (baked into each
-  drive's systemd unit as `-j N`); change it later by editing the `-j`
+- Rip-only is the default, so a rip never waits on the CPU. If you enable
+  encoding (`-e` / `ENCODE_AFTER_RIP=1`) or run `-m encode`, HandBrake's x265
+  encode is the CPU-heavy step and is gated by `-j` (default **2**
+  simultaneous encodes, system-wide, regardless of how many drives or
+  `-m encode` runs are active); extra jobs wait their turn for a slot.
+  `setup.sh` asks for this limit when installing the automation (baked into
+  each drive's systemd unit as `-j N`); change it later by editing the `-j`
   value in `/etc/systemd/system/rip-disc@.service` and running
   `sudo systemctl daemon-reload`. Pick a value based on your CPU — each
   x265 encode is itself multi-threaded, so "2" already uses a lot of
   cores; raise it only if you have cores to spare, or set `-j 0` to
   disable the limiter entirely.
 - If a rip fails partway, the disc is **not** ejected, so a stalled drive
-  is visibly still occupied — check `journalctl -u rip-disc@sr1` to see why
+  is visibly still occupied (the same applies when the free-space guard or
+  the integrity check refuses a rip) — check `journalctl -u rip-disc@sr1` to see why
   (or `sudo systemctl status rip-disc-console.service` for the reserved
   interactive drive, if you set one up).
 
@@ -365,13 +446,13 @@ load all 8 discs and close the trays — that's it, nothing to type anywhere.
   then waiting for the next disc — same as any other drive, just with a
   human in the loop for this one.
 
-Meanwhile, encoding is the CPU-bound step everything funnels into: with
-the default `-j 2`, only 2 encodes run at a time *across all 8 drives*
-(sr0's console was given the same `-j` value at setup, so it shares the
-same pool of encode slots rather than getting its own). Realistically, all
-8 rips proceed in parallel and finish (and eject) within minutes of each
-other; the raw files then queue up and get encoded 2-at-a-time in the
-background — drives are free to reload long before encoding catches up.
+Because rip-only is the default, all 8 rips proceed in parallel, are
+verified, and eject within minutes of each other — drives are free to
+reload right away, and the raw `.mkv` files are already in your Jellyfin
+library. (If you set `ENCODE_AFTER_RIP=1`, encoding then runs behind the
+shared `-j` limit: with the default `-j 2`, only 2 encodes run at a time
+across all 8 drives, sr0's console included.) Encode whatever you like
+later with `./rip-disc.sh -m encode`.
 
 Watch it all from one terminal:
 
@@ -417,13 +498,17 @@ what this script produces by default.
 
 ## Notes
 
-- Video encodes keep all audio tracks (AC3/DTS passthrough where possible,
-  AAC fallback), plus chapter markers. Subtitles are included as soft
-  (selectable) tracks — never burned in — filtered to the languages set by
-  `-L` (default English only); if the disc has no matching subtitle track,
-  none are added and encoding proceeds normally.
-- Two-pass x265 encoding is used for consistent quality; expect a rip to
-  take significantly longer than the runtime of the disc.
+- Raw (rip-only) files keep everything MakeMKV extracts: all audio tracks,
+  all subtitle languages, chapters. Encodes keep all audio tracks (AC3/DTS
+  passthrough where possible, AAC fallback) and chapter markers; subtitles
+  are soft (selectable) tracks — never burned in — filtered to the languages
+  set by `-L` (default English only) at *encode* time.
+- Raw rips are large (DVD ≈ 4–8 GB, Blu-ray ≈ 20–40 GB) and Jellyfin may need
+  to transcode them for some clients — Blu-ray rips especially are worth
+  encoding sooner rather than later.
+- Two-pass x265 encoding is used for consistent quality; expect an encode to
+  take significantly longer than the runtime of the disc (use `-H` to trade
+  some compression efficiency for speed).
 - Data discs (non-VIDEO_TS/BDMV, non-audio-CD) are not supported and the
   script will exit with an error.
 - Commercial Blu-ray discs use AACS encryption, which MakeMKV decrypts

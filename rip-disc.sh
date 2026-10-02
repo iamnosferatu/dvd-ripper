@@ -5,10 +5,22 @@
 #
 # Auto-detects what's in the drive and routes to the right pipeline:
 #   Audio CD        -> abcde (cdparanoia + FLAC + MusicBrainz tagging)
-#   DVD/Blu-ray, movie -> MakeMKV (main feature) -> HandBrakeCLI (H.265 encode)
+#   DVD/Blu-ray, movie -> MakeMKV (main feature) -> [optional] HandBrakeCLI
 #   DVD/Blu-ray, TV    -> MakeMKV title scan -> interactive confirmation of
-#                         which titles map to which episodes -> HandBrakeCLI,
-#                         named S01E01...
+#                         which titles map to which episodes -> [optional]
+#                         HandBrakeCLI, named S01E01...
+#
+# Rip-only by default: video discs are ripped with MakeMKV straight to their
+# final Jellyfin name (lossless, no re-encode) and ejected. Each raw rip gets
+# a sidecar marker (Name.mkv.raw). Encoding is opt-in: pass -e (or set
+# ENCODE_AFTER_RIP=1 in ~/.config/rip-disc/config) to encode right after the
+# rip, or run `./rip-disc.sh -m encode` later to pick which raw files to
+# encode. An encode replaces the raw file in place, only after the new file
+# has been verified; the raw file is never deleted before that.
+#
+# Config file (~/.config/rip-disc/config, override path with RIP_DISC_CONFIG),
+# plain shell assignments read before flags are parsed, e.g.:
+#   ENCODE_AFTER_RIP=0   QUALITY=20   HW_ENCODE=0   MIN_FREE_GB=10
 #
 # For a video disc, auto mode asks "Movie or TV show?" (and, for TV, the
 # season number) unless -y or an explicit -m is given — see "Unattended /
@@ -43,21 +55,32 @@
 #
 #   MakeMKV's raw rip is disc I/O, not CPU, so every drive can do that step
 #   at once with no contention. The disc is ejected (see -E) as soon as its
-#   raw rip finishes — not after encoding — since the drive is never touched
-#   again once the rip is on local disk. HandBrake's x265 encode is
-#   CPU-heavy, so -j caps how many encodes run at once *across all drives*;
-#   a drive whose own rip is already done just sits queued (raw file on
-#   local disk, drive already free for the next disc) until an encode slot
-#   opens up. The limit is enforced with flock on shared lock files in /tmp,
-#   so it applies across every concurrently running rip-disc.sh process.
+#   raw rip is verified — never after encoding — since the drive is not
+#   touched again once the rip is on local disk. HandBrake's x265 encode is
+#   CPU-heavy, so -j caps how many encodes run at once *across all drives*
+#   (a flock-based limit shared by every rip-disc.sh process).
+#
+#   Free-space guard: before ripping, the script reserves roughly the disc's
+#   size (plus a MIN_FREE_GB headroom, -f) against the library filesystem,
+#   counting reservations made by other rips in progress, and refuses to
+#   start if there isn't room — leaving the disc in the drive. Encodes
+#   reserve about half the raw file's size for the new file.
+#
+#   Integrity check: each rip is verified with ffprobe (has video + audio
+#   streams, and is not truncated) before it is moved into the library. A
+#   rip that fails is renamed Name.mkv.failed and the disc is NOT ejected.
 #
 # Usage:
-#   ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music] [-n "Name"] [-s SEASON]
-#                 [-o /path/to/library] [-q QUALITY] [-l MINLENGTH_SECONDS]
-#                 [-L eng,fre,...] [-K TMDB_API_KEY] [-M] [-y] [-E] [-j N] [-k]
+#   ./rip-disc.sh [-d /dev/sr0] [-m auto|movie|tv|music|encode] [-n "Name"]
+#                 [-s SEASON] [-o /path/to/library] [-q QUALITY]
+#                 [-l MINLENGTH_SECONDS] [-L eng,fre,...] [-K TMDB_API_KEY]
+#                 [-M] [-y] [-E] [-j N] [-H] [-e|-r] [-f GB] [FILE...]
 #
 #   -d DEVICE     Optical drive device (default: /dev/sr0)
-#   -m MODE       auto (default) | movie | tv | music
+#   -m MODE       auto (default) | movie | tv | music | encode
+#                 encode: no disc needed — encode raw rips already in the
+#                 library (pick interactively, or pass FILE paths; with -y
+#                 encode everything pending). Replaces each raw file in place.
 #   -n NAME       Movie title "Name (Year)", or TV show name. Skips TMDb lookup
 #                 entirely and uses this name as given.
 #   -s SEASON     Season number for TV mode (default: 1)
@@ -80,7 +103,13 @@
 #                 HandBrakeCLI built with QSV/oneVPL support and the Intel
 #                 media driver installed (setup.sh offers this) — the script
 #                 verifies the encoder is actually available before ripping.
-#   -k            Keep temporary raw-rip files instead of deleting them after encode
+#   -e            Encode right after the rip (default is rip-only, unless
+#                 ENCODE_AFTER_RIP=1 is set in the config file)
+#   -r            Rip only, no encode (overrides ENCODE_AFTER_RIP=1 in config)
+#   -f GB         Free-space headroom to keep beyond the estimated need
+#                 (default: 10; 0 disables the free-space guard entirely)
+#
+# Interactive runs (no -y) with neither -e nor -r ask "Encode after ripping?".
 #
 set -euo pipefail
 
@@ -103,8 +132,23 @@ NONINTERACTIVE=0
 AUTO_EJECT=1
 MAX_ENCODES=2
 HW_ENCODE=0
-KEEP_TEMP=0
+ENCODE_AFTER_RIP=0
+ENCODE_FLAG_SET=0
+MIN_FREE_GB=10
+RIPPED_FILES=()
+ENCODE_PATHS=()
+RIP_ROOT=""
+RIP_TMP=""
 WORKDIR="$(mktemp -d /tmp/discrip.XXXXXX)"
+
+# Optional config file: plain shell assignments overriding the defaults above
+# (flags still win). Lets the udev/systemd automation pick up a global setting
+# like ENCODE_AFTER_RIP without editing any unit files.
+CONFIG_FILE="${RIP_DISC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/rip-disc/config}"
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+fi
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -120,7 +164,14 @@ cleanup() {
     if [[ "$MOUNTED_BY_US" -eq 1 && -n "$MOUNT_POINT" ]]; then
         udisksctl unmount -b "$DEVICE" >/dev/null 2>&1 || true
     fi
-    if [[ "$KEEP_TEMP" -eq 0 && -d "$WORKDIR" ]]; then
+    if declare -F release_space >/dev/null; then
+        release_space
+    fi
+    if [[ -n "$RIP_TMP" && -d "$RIP_TMP" ]]; then
+        rm -rf "$RIP_TMP"
+        rmdir "$(dirname "$RIP_TMP")" 2>/dev/null || true
+    fi
+    if [[ -d "$WORKDIR" ]]; then
         rm -rf "$WORKDIR"
     fi
 }
@@ -138,7 +189,7 @@ sanitize() {
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-while getopts "d:m:n:s:o:q:l:L:K:MyEj:Hkh" opt; do
+while getopts "d:m:n:s:o:q:l:L:K:MyEj:Herf:h" opt; do
     case "$opt" in
         d) DEVICE="$OPTARG" ;;
         m) MODE="$OPTARG" ;;
@@ -154,20 +205,30 @@ while getopts "d:m:n:s:o:q:l:L:K:MyEj:Hkh" opt; do
         E) AUTO_EJECT=0 ;;
         j) MAX_ENCODES="$OPTARG" ;;
         H) HW_ENCODE=1 ;;
-        k) KEEP_TEMP=1 ;;
+        e) ENCODE_AFTER_RIP=1; ENCODE_FLAG_SET=1 ;;
+        r) ENCODE_AFTER_RIP=0; ENCODE_FLAG_SET=1 ;;
+        f) MIN_FREE_GB="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
 done
+shift $((OPTIND - 1))
+ENCODE_PATHS=("$@")
 
 [[ "$MAX_ENCODES" =~ ^[0-9]+$ ]] || die "Invalid -j value '$MAX_ENCODES': must be a non-negative integer (0 = unlimited)."
-
-[[ -b "$DEVICE" ]] || die "Device '$DEVICE' does not look like a block device. Pass the correct drive with -d."
+[[ "$MIN_FREE_GB" =~ ^[0-9]+$ ]] || die "Invalid -f value '$MIN_FREE_GB': must be a non-negative integer (0 = disable the guard)."
+[[ "$ENCODE_AFTER_RIP" =~ ^[01]$ ]] || die "ENCODE_AFTER_RIP must be 0 or 1 (check $CONFIG_FILE)."
 
 case "$MODE" in
-    auto|movie|tv|music) ;;
-    *) die "Invalid mode '$MODE'. Use auto, movie, tv, or music." ;;
+    auto|movie|tv|music|encode) ;;
+    *) die "Invalid mode '$MODE'. Use auto, movie, tv, music, or encode." ;;
 esac
+
+if [[ "$MODE" != "encode" ]]; then
+    [[ -b "$DEVICE" ]] || die "Device '$DEVICE' does not look like a block device. Pass the correct drive with -d."
+fi
+
+RIP_ROOT="${OUTPUT_ROOT_OVERRIDE:-$VIDEO_OUTPUT_ROOT}"
 
 # ---------------------------------------------------------------------------
 # Disc type detection
@@ -308,9 +369,153 @@ EOF
 # Shared: MakeMKV raw extraction
 # ---------------------------------------------------------------------------
 check_video_deps() {
-    for bin in makemkvcon HandBrakeCLI; do
-        command -v "$bin" >/dev/null 2>&1 || die "'$bin' not found. Install MakeMKV and HandBrake CLI first."
+    local bin
+    for bin in makemkvcon ffprobe; do
+        command -v "$bin" >/dev/null 2>&1 || die "'$bin' not found. Install MakeMKV (and 'sudo apt-get install -y ffmpeg' for ffprobe) first."
     done
+    # HandBrakeCLI is only needed when encoding.
+    if [[ "$ENCODE_AFTER_RIP" -eq 1 ]]; then
+        command -v HandBrakeCLI >/dev/null 2>&1 || die "'HandBrakeCLI' not found, but encoding was requested. Install handbrake-cli or use -r."
+    fi
+}
+
+check_encode_deps() {
+    local bin
+    for bin in HandBrakeCLI ffprobe; do
+        command -v "$bin" >/dev/null 2>&1 || die "'$bin' not found. Install handbrake-cli and ffmpeg first."
+    done
+}
+
+# --- Media helpers -----------------------------------------------------------
+
+# Whole-second duration of a media file (0 if unreadable).
+media_duration() {
+    local d
+    d="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null || true)"
+    d="${d%%.*}"
+    [[ "$d" =~ ^[0-9]+$ ]] || d=0
+    echo "$d"
+}
+
+# "H:MM:SS" (MakeMKV's format) -> seconds.
+duration_to_secs() {
+    local h=0 m=0 s=0
+    IFS=: read -r h m s <<< "$1"
+    echo $(( 10#${h:-0} * 3600 + 10#${m:-0} * 60 + 10#${s:-0} ))
+}
+
+secs_to_hms() {
+    printf '%d:%02d:%02d' $(( $1 / 3600 )) $(( ($1 % 3600) / 60 )) $(( $1 % 60 ))
+}
+
+# validate_media FILE MIN_SECONDS — has video + audio streams and is not
+# shorter than MIN_SECONDS (guards against truncated/failed rips and encodes).
+validate_media() {
+    local f="$1" min_secs="$2" streams dur
+    streams="$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null || true)"
+    grep -q '^video' <<< "$streams" || return 1
+    grep -q '^audio' <<< "$streams" || return 1
+    dur="$(media_duration "$f")"
+    [[ "$dur" -ge "$min_secs" ]]
+}
+
+# --- Free-space guard --------------------------------------------------------
+# Each in-flight rip/encode writes a reservation file (named by PID, holding
+# the bytes it expects to use) into a shared dir. A new job only starts if the
+# filesystem's free space, minus other live reservations, covers its own need
+# plus MIN_FREE_GB headroom — so 8 drives starting at once can't collectively
+# overfill the disk. The check-and-reserve runs under a flock so two jobs can't
+# both claim the same space. Dead PIDs' reservations are discarded.
+RESERVE_DIR="/tmp/.rip-disc-reservations"
+RESERVATION_FILE=""
+
+disc_size_bytes() {
+    local b
+    b="$(blockdev --getsize64 "$DEVICE" 2>/dev/null || echo 0)"
+    # Can't read it? Assume a single-layer Blu-ray (25 GB) to stay safe.
+    [[ "$b" =~ ^[0-9]+$ && "$b" -gt 0 ]] || b=$(( 25 * 1073741824 ))
+    echo "$b"
+}
+
+reserved_bytes() {
+    local total=0 f pid val
+    for f in "$RESERVE_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        pid="${f##*/}"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            val="$(cat "$f" 2>/dev/null || echo 0)"
+            [[ "$val" =~ ^[0-9]+$ ]] || val=0
+            total=$(( total + val ))
+        else
+            rm -f "$f"
+        fi
+    done
+    echo "$total"
+}
+
+# reserve_space NEED_BYTES DIR LABEL — returns 1 (with a warning) if short.
+reserve_space() {
+    local need="$1" dir="$2" label="$3"
+    [[ "$MIN_FREE_GB" -gt 0 ]] || return 0
+
+    mkdir -p "$RESERVE_DIR" "$dir"
+    chmod 1777 "$RESERVE_DIR" 2>/dev/null || true
+
+    local lockfd avail reserved headroom shortfall
+    exec {lockfd}>"${RESERVE_DIR}/.lock"
+    flock "$lockfd"
+
+    avail="$(df -B1 --output=avail "$dir" 2>/dev/null | tail -n1 | tr -d ' ')"
+    [[ "$avail" =~ ^[0-9]+$ ]] || avail=0
+    reserved="$(reserved_bytes)"
+    headroom=$(( MIN_FREE_GB * 1073741824 ))
+
+    if (( avail - reserved < need + headroom )); then
+        exec {lockfd}>&-
+        shortfall=$(( (need + headroom - (avail - reserved) + 1073741823) / 1073741824 ))
+        warn "Not enough free space for ${label}: need ~$(( need / 1073741824 )) GB + ${MIN_FREE_GB} GB headroom, have $(( avail / 1073741824 )) GB free ($(( reserved / 1073741824 )) GB reserved by other jobs) on the filesystem holding ${dir}. Short by ~${shortfall} GB."
+        return 1
+    fi
+
+    echo "$need" > "${RESERVE_DIR}/$$"
+    RESERVATION_FILE="${RESERVE_DIR}/$$"
+    exec {lockfd}>&-
+}
+
+release_space() {
+    if [[ -n "$RESERVATION_FILE" ]]; then
+        rm -f "$RESERVATION_FILE"
+        RESERVATION_FILE=""
+    fi
+}
+
+# Per-process scratch dir on the SAME filesystem as the library (hidden, at
+# the library root next to Movies/ and TV Shows/ so Jellyfin never scans it),
+# so finished rips move into place with an atomic rename.
+init_rip_tmp() {
+    RIP_TMP="${RIP_ROOT}/.rip-tmp/$$"
+    mkdir -p "$RIP_TMP"
+}
+
+# finalize_rip TMP_FILE FINAL_PATH MIN_SECONDS — verify, then move into the
+# library with a .raw marker. On a failed check the file is renamed
+# FINAL_PATH.failed (Jellyfin ignores it) and 1 is returned.
+finalize_rip() {
+    local tmp="$1" final="$2" min_secs="$3"
+    if [[ -e "$final" || -e "${final}.raw" ]]; then
+        warn "Refusing to overwrite existing file: $final (remove it or choose another name with -n)."
+        return 1
+    fi
+    mkdir -p "$(dirname "$final")"
+    if ! validate_media "$tmp" "$min_secs"; then
+        mv -f -- "$tmp" "${final}.failed"
+        warn "Rip failed verification (missing video/audio or shorter than ${min_secs}s): kept as ${final}.failed"
+        return 1
+    fi
+    mv -- "$tmp" "$final"
+    printf 'ripped=%s\n' "$(date -Is)" > "${final}.raw"
+    RIPPED_FILES+=("$final")
+    log "Ripped: $final"
 }
 
 # Scan title list via MakeMKV's robot output (-r) so we can show durations
@@ -405,11 +610,9 @@ confirm_episode_selection() {
 
 DISC_EJECTED=0
 
-# Ejects as soon as MakeMKV's raw rip is done, not after encoding — once the
-# rip is on local disk, HandBrake never touches the drive again, so there's
-# no concurrency issue freeing the drive early. This is what lets a drive's
-# turnaround be just its (fast, I/O-bound) rip time instead of rip+encode,
-# even while its encode is still queued behind -j on other drives.
+# Ejects as soon as the rip is verified, never after encoding — once the rip
+# is on local disk the drive isn't touched again, so a drive's turnaround is
+# just its (fast, I/O-bound) rip time.
 eject_disc() {
     [[ "$AUTO_EJECT" -eq 1 ]] || return 0
     [[ "$DISC_EJECTED" -eq 1 ]] && return 0
@@ -419,7 +622,7 @@ eject_disc() {
         MOUNTED_BY_US=0
     fi
 
-    log "Rip complete — ejecting $DEVICE (encoding continues from the local copy)..."
+    log "Rip verified — ejecting $DEVICE..."
     if eject "$DEVICE" 2>/dev/null; then
         DISC_EJECTED=1
     else
@@ -478,15 +681,17 @@ check_hw_encode() {
         "Hardware encoding (-H) requested, but this HandBrakeCLI build has no qsv_h265 encoder. It needs to be built with Intel QSV/oneVPL support, and the Intel media driver installed — see setup.sh's optional Quick Sync step, or drop -H to use software x265."
 }
 
+# encode_one RAW OUT — runs HandBrakeCLI inside an encode slot and returns its
+# exit status (so callers can handle a failed encode without aborting).
 encode_one() {
-    local raw="$1" final_path="$2"
+    local raw="$1" out="$2" rc=0
 
     acquire_encode_slot
     if [[ "$HW_ENCODE" -eq 1 ]]; then
         check_hw_encode
         HandBrakeCLI \
             --input "$raw" \
-            --output "$final_path" \
+            --output "$out" \
             --encoder qsv_h265 \
             --quality "$QUALITY" \
             --encoder-preset quality \
@@ -498,11 +703,11 @@ encode_one() {
             --subtitle-burned=none \
             --markers \
             --optimize \
-            --format av_mkv
+            --format av_mkv || rc=$?
     else
         HandBrakeCLI \
             --input "$raw" \
-            --output "$final_path" \
+            --output "$out" \
             --encoder x265 \
             --quality "$QUALITY" \
             --encoder-preset medium \
@@ -516,9 +721,57 @@ encode_one() {
             --optimize \
             --format av_mkv \
             --two-pass \
-            --turbo
+            --turbo || rc=$?
     fi
     release_encode_slot
+    return "$rc"
+}
+
+# encode_in_place FILE — encode a raw rip and replace it with the result.
+# Writes to the scratch dir first, verifies the output, and only then swaps it
+# over the raw file and removes the .raw marker. On any failure the raw file
+# and marker are left untouched. Returns 1 on failure.
+encode_in_place() {
+    local f="$1" size src_dur out
+    size="$(stat -c %s "$f")"
+    src_dur="$(media_duration "$f")"
+
+    if [[ -z "$RIP_TMP" ]]; then
+        init_rip_tmp
+    fi
+    out="${RIP_TMP}/$(basename "$f")"
+
+    if ! reserve_space $(( size / 2 )) "$RIP_ROOT" "encode of $(basename "$f")"; then
+        return 1
+    fi
+
+    log "Encoding in place: $f"
+    if encode_one "$f" "$out" && validate_media "$out" $(( src_dur * 98 / 100 )); then
+        mv -f -- "$out" "$f"
+        rm -f -- "${f}.raw"
+        release_space
+        log "Finished: $f (raw file replaced by the encode)"
+        return 0
+    fi
+
+    warn "Encode failed or its output failed verification — keeping the raw file: $f"
+    rm -f -- "$out"
+    release_space
+    return 1
+}
+
+# After a video rip: either encode what was ripped (-e / ENCODE_AFTER_RIP=1)
+# or just point at how to encode later.
+finish_video_job() {
+    if [[ "$ENCODE_AFTER_RIP" -eq 1 ]]; then
+        local f failed=0
+        for f in "${RIPPED_FILES[@]}"; do
+            encode_in_place "$f" || failed=$(( failed + 1 ))
+        done
+        [[ "$failed" -eq 0 ]] || die "${failed} encode(s) failed; the affected raw rip(s) were kept and are still marked .raw."
+    else
+        log "Rip-only: ${#RIPPED_FILES[@]} raw file(s) saved. Encode later with:  $0 -m encode"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -555,38 +808,46 @@ rip_movie() {
     safe_name="$(sanitize "$movie_name")"
     [[ -n "$safe_name" ]] || die "Resulting movie name is empty after sanitizing. Pass one explicitly with -n."
 
-    local output_root="${OUTPUT_ROOT_OVERRIDE:-$VIDEO_OUTPUT_ROOT}/Movies"
+    local output_root="${RIP_ROOT}/Movies"
     local output_dir="${output_root}/${safe_name}"
     mkdir -p "$output_dir"
 
     log "Movie name : $safe_name"
     log "Output dir : $output_dir"
 
+    if [[ -e "${output_dir}/${safe_name}.mkv" || -e "${output_dir}/${safe_name}.mkv.raw" ]]; then
+        die "'${output_dir}/${safe_name}.mkv' already exists — not overwriting. Remove it or pass a different name with -n. (Disc left in the drive.)"
+    fi
+
+    init_rip_tmp
+    reserve_space "$(disc_size_bytes)" "$RIP_ROOT" "rip of ${safe_name}" \
+        || die "Not starting the rip — free up space or lower -f. (Disc left in the drive.)"
+
     local src="dev:${DEVICE}"
     log "Ripping main feature (longest title) with MakeMKV..."
-    makemkvcon mkv "$src" 0 "$WORKDIR" --minlength="$MINLENGTH" --noscan || {
+    makemkvcon mkv "$src" 0 "$RIP_TMP" --minlength="$MINLENGTH" --noscan || {
         warn "Title 0 rip failed or wasn't the main feature; falling back to ripping all titles."
-        makemkvcon mkv "$src" all "$WORKDIR" --minlength="$MINLENGTH" --noscan
+        rm -f "$RIP_TMP"/*.mkv
+        makemkvcon mkv "$src" all "$RIP_TMP" --minlength="$MINLENGTH" --noscan
     }
 
     shopt -s nullglob
-    local raw_files=("$WORKDIR"/*.mkv)
+    local raw_files=("$RIP_TMP"/*.mkv)
     shopt -u nullglob
     [[ ${#raw_files[@]} -gt 0 ]] || die "MakeMKV produced no output files. Check the disc and drive."
 
-    eject_disc
-
-    local index=0
+    local index=0 raw
     for raw in "${raw_files[@]}"; do
         index=$((index + 1))
         local final_name="$safe_name"
         [[ ${#raw_files[@]} -gt 1 ]] && final_name="${safe_name} - Part ${index}"
-        local final_path="${output_dir}/${final_name}.mkv"
-
-        log "Encoding: $(basename "$raw") -> ${final_name}.mkv"
-        encode_one "$raw" "$final_path"
-        log "Finished: $final_path"
+        finalize_rip "$raw" "${output_dir}/${final_name}.mkv" "$MINLENGTH" \
+            || die "Rip verification failed — disc left in the drive."
     done
+    release_space
+
+    eject_disc
+    finish_video_job
 
     log "All done. Point Jellyfin's Movies library at: $output_root"
 }
@@ -628,7 +889,7 @@ rip_tv() {
     local season_padded
     season_padded="$(printf '%02d' "$SEASON")"
 
-    local output_root="${OUTPUT_ROOT_OVERRIDE:-$VIDEO_OUTPUT_ROOT}/TV Shows"
+    local output_root="${RIP_ROOT}/TV Shows"
     local season_dir="${output_root}/${safe_show}/Season ${season_padded}"
     mkdir -p "$season_dir"
 
@@ -639,19 +900,22 @@ rip_tv() {
     scan_titles
     confirm_episode_selection
 
-    # Phase 1: rip every selected episode from the disc first (each title
-    # into its own subdirectory so they don't overwrite each other), then
-    # eject — the disc isn't needed again once these files are on local
-    # disk. Phase 2 (below) encodes from those local files only.
+    init_rip_tmp
+    reserve_space "$(disc_size_bytes)" "$RIP_ROOT" "rip of ${safe_show} S${season_padded}" \
+        || die "Not starting the rip — free up space or lower -f. (Disc left in the drive.)"
+
+    # Rip every selected episode while the disc is in the drive (each title
+    # into its own scratch subdir), verify it against the duration MakeMKV
+    # reported, and move it into the library as it completes. Eject once all
+    # are done — the disc isn't needed again.
     local src="dev:${DEVICE}"
     local ep=0 id
-    local raw_paths=() final_paths=()
     for id in "${SELECTED_TITLES[@]}"; do
         ep=$((ep + 1))
         local ep_padded
         ep_padded="$(printf '%02d' "$ep")"
         local final_path="${season_dir}/${safe_show} - S${season_padded}E${ep_padded}.mkv"
-        local rip_dir="${WORKDIR}/rip-${id}"
+        local rip_dir="${RIP_TMP}/title-${id}"
         mkdir -p "$rip_dir"
 
         log "Ripping title $id (-> S${season_padded}E${ep_padded}) with MakeMKV..."
@@ -662,32 +926,117 @@ rip_tv() {
         shopt -u nullglob
         [[ ${#title_files[@]} -eq 1 ]] || die "Expected exactly one output file ripping title $id, found ${#title_files[@]}."
 
-        raw_paths+=("${title_files[0]}")
-        final_paths+=("$final_path")
+        local expected min_secs
+        expected="$(duration_to_secs "${TITLE_DURATION[$id]:-0:00:00}")"
+        min_secs=$(( expected * 95 / 100 ))
+        finalize_rip "${title_files[0]}" "$final_path" "$min_secs" \
+            || die "Rip verification failed for title $id — disc left in the drive."
     done
+    release_space
 
-    log "All ${#raw_paths[@]} episode(s) ripped from disc."
+    log "All ${#RIPPED_FILES[@]} episode(s) ripped and verified."
     eject_disc
-
-    # Phase 2: encode each local raw file.
-    local i
-    for (( i=0; i<${#raw_paths[@]}; i++ )); do
-        log "Encoding: $(basename "${raw_paths[$i]}") -> $(basename "${final_paths[$i]}")"
-        encode_one "${raw_paths[$i]}" "${final_paths[$i]}"
-        log "Finished: ${final_paths[$i]}"
-
-        [[ "$KEEP_TEMP" -eq 1 ]] || rm -f "${raw_paths[$i]}"
-    done
+    finish_video_job
 
     log "All done. Point Jellyfin's TV Shows library at: $output_root"
 }
 
 # ---------------------------------------------------------------------------
+# Encode mode (-m encode): encode raw rips already in the library
+# ---------------------------------------------------------------------------
+
+# parse_selection "1 3 5-7" MAX — fills SELECTION with validated 1-based indexes.
+parse_selection() {
+    local input="${1//,/ }" max="$2" tok a b i
+    SELECTION=()
+    for tok in $input; do
+        if [[ "$tok" == "all" ]]; then
+            for (( i=1; i<=max; i++ )); do SELECTION+=("$i"); done
+        elif [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
+            (( a >= 1 && b <= max && a <= b )) || return 1
+            for (( i=a; i<=b; i++ )); do SELECTION+=("$i"); done
+        elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+            (( tok >= 1 && tok <= max )) || return 1
+            SELECTION+=("$tok")
+        else
+            return 1
+        fi
+    done
+    [[ ${#SELECTION[@]} -gt 0 ]]
+}
+
+encode_pending() {
+    check_encode_deps
+    [[ "$HW_ENCODE" -eq 1 ]] && check_hw_encode
+
+    local files=() f marker
+    if [[ ${#ENCODE_PATHS[@]} -gt 0 ]]; then
+        for f in "${ENCODE_PATHS[@]}"; do
+            [[ -f "$f" ]] || die "No such file: $f"
+            [[ -f "${f}.raw" ]] || warn "$f has no .raw marker — encoding it anyway since you named it explicitly."
+            files+=("$f")
+        done
+    else
+        [[ -d "$RIP_ROOT" ]] || die "Library root '$RIP_ROOT' doesn't exist."
+        while IFS= read -r -d '' marker; do
+            f="${marker%.raw}"
+            [[ -f "$f" ]] && files+=("$f")
+        done < <(find "$RIP_ROOT" -path "${RIP_ROOT}/.rip-tmp" -prune -o -type f -name '*.mkv.raw' -print0 | sort -z)
+    fi
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        log "Nothing to encode — no raw rips pending under $RIP_ROOT."
+        return 0
+    fi
+
+    local encoder_desc="software x265 (CRF ${QUALITY})"
+    [[ "$HW_ENCODE" -eq 1 ]] && encoder_desc="Intel Quick Sync qsv_h265 (quality ${QUALITY})"
+
+    SELECTION=()
+    if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+        parse_selection all "${#files[@]}"
+    else
+        echo
+        printf '  %-4s %-9s %-10s %s\n' "#" "Size" "Duration" "File"
+        printf '  %-4s %-9s %-10s %s\n' "--" "----" "--------" "----"
+        local i=0 size dur
+        for f in "${files[@]}"; do
+            i=$((i + 1))
+            size="$(numfmt --to=iec --suffix=B "$(stat -c %s "$f")" 2>/dev/null || echo '?')"
+            dur="$(secs_to_hms "$(media_duration "$f")")"
+            printf '  %-4s %-9s %-10s %s\n' "$i" "$size" "$dur" "${f#"${RIP_ROOT}"/}"
+        done
+        echo
+        echo "Encoder: ${encoder_desc}. Each raw file is replaced in place once its encode is verified."
+        read -r -p "Select files to encode (e.g. '1 3 5-7' or 'all'; Enter to cancel): " reply
+        [[ -n "$reply" ]] || { log "Cancelled."; return 0; }
+        parse_selection "$reply" "${#files[@]}" || die "Invalid selection '$reply'."
+        read -r -p "Encode ${#SELECTION[@]} file(s) with ${encoder_desc}? [y/N] " reply
+        [[ "$reply" =~ ^[Yy]$ ]] || { log "Cancelled."; return 0; }
+    fi
+
+    local idx failed=0 done_count=0
+    for idx in "${SELECTION[@]}"; do
+        if encode_in_place "${files[$((idx - 1))]}"; then
+            done_count=$((done_count + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done
+
+    log "Encode finished: ${done_count} succeeded, ${failed} failed."
+    [[ "$failed" -eq 0 ]] || exit 1
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-command -v blkid >/dev/null 2>&1 || die "'blkid' not found (should ship with util-linux)."
-if [[ "$AUTO_EJECT" -eq 1 ]]; then
-    command -v eject >/dev/null 2>&1 || die "'eject' not found. Install with: sudo apt-get install -y eject (or pass -E to skip auto-eject)."
+if [[ "$MODE" != "encode" ]]; then
+    command -v blkid >/dev/null 2>&1 || die "'blkid' not found (should ship with util-linux)."
+    if [[ "$AUTO_EJECT" -eq 1 ]]; then
+        command -v eject >/dev/null 2>&1 || die "'eject' not found. Install with: sudo apt-get install -y eject (or pass -E to skip auto-eject)."
+    fi
 fi
 
 RESOLVED_MODE="$MODE"
@@ -726,7 +1075,24 @@ else
     fi
 fi
 
+# Rip-only is the default. Interactive runs (no -y) that didn't pass -e/-r get
+# asked per disc, defaulting to the configured ENCODE_AFTER_RIP value.
+if [[ "$RESOLVED_MODE" == "movie" || "$RESOLVED_MODE" == "tv" ]]; then
+    if [[ "$NONINTERACTIVE" -eq 0 && "$ENCODE_FLAG_SET" -eq 0 ]]; then
+        if [[ "$ENCODE_AFTER_RIP" -eq 1 ]]; then hint="[Y/n]"; else hint="[y/N]"; fi
+        read -r -p "Encode after ripping? ${hint} " encode_reply
+        if [[ -n "$encode_reply" ]]; then
+            if [[ "$encode_reply" =~ ^[Yy] ]]; then ENCODE_AFTER_RIP=1; else ENCODE_AFTER_RIP=0; fi
+        fi
+    fi
+    # Fail early (before ripping) if the chosen encoder can't run.
+    if [[ "$ENCODE_AFTER_RIP" -eq 1 && "$HW_ENCODE" -eq 1 ]]; then
+        check_hw_encode
+    fi
+fi
+
 case "$RESOLVED_MODE" in
+    encode) encode_pending ;;
     music) rip_music ;;
     movie) rip_movie ;;
     tv)    rip_tv ;;
