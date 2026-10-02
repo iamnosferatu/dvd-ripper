@@ -419,40 +419,72 @@ A few things worth knowing for an 8-drive-style setup:
 ### Walkthrough: loading all 8 drives at once
 
 Say `/dev/sr0` has a TV series, `/dev/sr1`–`/dev/sr6` have movies, and
-`/dev/sr7` has a music CD. Do you need to start 8 scripts by hand, or can
-you set it all off at once?
+`/dev/sr7` has a music CD, and you've left the defaults alone (rip-only, no
+`ENCODE_AFTER_RIP`). Do you need to start 8 scripts by hand, or can you set
+it all off at once?
 
 **If you reserved sr0 as the interactive drive when running `setup.sh`:**
-load all 8 discs and close the trays — that's it, nothing to type anywhere.
+load all 8 discs and close the trays — nothing to type for seven of them.
 
-- **sr1–sr6 (movies):** each independently fires its own
-  `rip-disc@srN.service` the instant its media is readable. Auto-detected
-  as DVD/Blu-ray → movie mode, TMDb auto-picks the top match (`-y` is baked
-  into the automated path), and each **ejects as soon as its own rip
-  finishes** — likely within minutes of each other, well before any
-  encoding is done.
-- **sr7 (music CD):** auto-detected as an audio CD → music mode. `abcde`
-  rips and tags it via MusicBrainz, then ejects when done — usually the
-  fastest of the eight.
-- **sr0 (TV series):** excluded from the udev rule, so it's the
-  always-running `rip-disc-console.service` that notices the disc instead.
-  Switch to its virtual terminal (e.g. `Ctrl+Alt+F9`) and you'll see:
-  ```
-  Video disc detected. Is this a Movie or a TV show? [M/t] t
-  Season number [1]: 1
-  ```
-  followed by the usual TMDb match picker and episode-title confirmation.
-  Answer those, and the console goes back to ripping, encoding, ejecting,
-  then waiting for the next disc — same as any other drive, just with a
-  human in the loop for this one.
+1. **Each drive starts itself.** For sr1–sr7, udev fires
+   `rip-disc@srN.service` the instant media is readable. Before ripping,
+   each job runs the free-space guard: it reserves about its disc's size
+   (plus the 10 GB headroom) against the library disk, counting what the
+   other drives have already claimed. If all eight fit, they all proceed;
+   if the disk is short, the ones that don't fit refuse to start, log how
+   many GB they're short, and **stay in their drives, not ejected,** so you can
+   see which ones need attention.
 
-Because rip-only is the default, all 8 rips proceed in parallel, are
-verified, and eject within minutes of each other — drives are free to
-reload right away, and the raw `.mkv` files are already in your Jellyfin
-library. (If you set `ENCODE_AFTER_RIP=1`, encoding then runs behind the
-shared `-j` limit: with the default `-j 2`, only 2 encodes run at a time
-across all 8 drives, sr0's console included.) Encode whatever you like
-later with `./rip-disc.sh -m encode`.
+2. **sr1–sr6 (movies)** auto-detect as DVD/Blu-ray → movie mode (the `-y`
+   baked into the automated path skips every prompt), TMDb auto-picks the top
+   match for the name, and MakeMKV rips the main feature into a scratch
+   folder inside your library. ffprobe checks it (video + audio, not
+   truncated), it's moved to `Movies/Name (Year)/Name (Year).mkv` with a
+   `Name (Year).mkv.raw` marker beside it, and the tray **opens** — all eight
+   rips run in parallel since it's pure disc I/O. There's no encode step to
+   wait for, so each drive is free to reload the moment its tray opens.
+
+3. **sr7 (music CD)** auto-detects as an audio CD → music mode. `abcde`
+   rips to FLAC, tags it via MusicBrainz, and ejects — usually the fastest
+   of the eight. Music is unaffected by the rip-only/encode distinction.
+
+4. **sr0 (TV series)** is excluded from the udev rule, so it's the
+   always-running `rip-disc-console.service` that notices the disc. Switch
+   to its virtual terminal (e.g. `Ctrl+Alt+F9`) and you'll be asked:
+   ```
+   Video disc detected. Is this a Movie or a TV show? [M/t] t
+   Season number [1]: 1
+   Encode after ripping? [y/N]
+   ```
+   followed by the TMDb match picker and the episode-title mapping to
+   confirm. Each episode is ripped, verified against the duration MakeMKV
+   reported, and moved into `TV Shows/Show/Season 01/` as
+   `Show - S01E01.mkv`, … with markers. The tray then opens and the console
+   goes back to waiting for the next disc. (Answer `y` to "Encode after
+   ripping?" if you want this one encoded straight away.)
+
+**What you're left with:** a playable Jellyfin library of lossless raw
+`.mkv` files, each with a `.raw` marker, a few minutes after loading the
+trays — no CPU-heavy encoding has happened yet. Whenever you're ready:
+
+```bash
+./rip-disc.sh -m encode          # pick which raw files to encode, e.g. '1 3 5-7' or 'all'
+./rip-disc.sh -m encode -H       # same, using Intel Quick Sync
+./rip-disc.sh -m encode -y       # encode everything pending, unattended (e.g. overnight)
+```
+
+Each encode replaces its raw file in place only after the new file has been
+verified, and the encodes share the same `-j` limit (default 2 at a time).
+If you'd rather have encoding happen automatically, set `ENCODE_AFTER_RIP=1`
+in `~/.config/rip-disc/config`: each drive then ejects as soon as its rip is
+verified and encodes behind the shared `-j` limit, so a drive's tray still
+opens after its rip, not after the encode.
+
+**If something goes wrong** the drive tells you: a tray that never opens
+means that drive's rip was refused or failed. Check why, e.g.
+`journalctl -u rip-disc@sr3 -f` — typical causes are the free-space guard
+(not enough room), a rip that failed verification (a `Name.mkv.failed` is
+left in the library, ignored by Jellyfin), or a file that already exists.
 
 Watch it all from one terminal:
 
@@ -465,7 +497,8 @@ systemctl list-units 'rip-disc@*'          # which automated instances are runni
 **If you didn't reserve a drive (or haven't installed the automation at
 all):** you're back to doing the TV drive by hand. Fire all 8 at once from
 one shell, backgrounding each and redirecting logs so they don't interleave
-on your terminal:
+on your terminal (rip-only is the default here too; add `-e` to encode
+afterwards):
 
 ```bash
 ./rip-disc.sh -d /dev/sr0 -m tv -n "Show Name" -s 1 -y > /tmp/sr0.log 2>&1 &
@@ -479,10 +512,11 @@ wait
 audio CD correctly on its own, same as the movie drives. `wait` blocks
 your terminal until all 8 background jobs finish; drop it to get your
 prompt back immediately and check progress with `tail -f /tmp/sr*.log`
-instead. (If automation *is* installed but you just didn't reserve a
-drive, stop the auto-triggered job for the TV drive first —
-`sudo systemctl stop rip-disc@sr0.service` — before running it manually,
-so the two don't race for the same disc.)
+instead. The free-space guard still applies, so simultaneous starts can't
+overfill the disk. (If automation *is* installed but you just didn't
+reserve a drive, stop the auto-triggered job for the TV drive first —
+`sudo systemctl stop rip-disc@sr0.service` — before running it manually, so
+the two don't race for the same disc.)
 
 ## Adding to Jellyfin
 
